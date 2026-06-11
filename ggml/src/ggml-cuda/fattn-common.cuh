@@ -1088,7 +1088,11 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // Also run the scan for small Q (decode) when the KV extent is large enough to amortize it:
+    //     with a unified KV cache multiple sequences share a single stream (Q->ne[3] == 1), so
+    //     K->ne[1] spans the cells of all sequences and each decode step otherwise iterates over
+    //     the fully masked-out cells of all other sequences.
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || K->ne[1] >= 8*FATTN_KQ_STRIDE)) {
         const int s31 = mask->nb[1] / sizeof(half2);
         const int s33 = mask->nb[3] / sizeof(half2);
 
