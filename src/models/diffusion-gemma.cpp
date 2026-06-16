@@ -507,11 +507,18 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         ggml_tensor * Vcur = kv.v;
 
         // The store is F16 under FA (halves the persistent K,V store; FA casts K,V to F16 anyway, so it is
-        // precision-neutral) and F32 otherwise. The fresh K,V stay F32: the store WRITE is an F32->store-type
-        // cpy (F32->F16 supported), but the prefix READ is cast back to F32 because the CUDA concat op is
-        // F32-only and FA re-casts to F16 itself. cast_kv() is a no-op when the store is already F32 (non-FA).
-        const auto cast_kv = [&](ggml_tensor * t) {
-            return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx0, t, GGML_TYPE_F32);
+        // precision-neutral) and F32 otherwise. The concat runs in the STORE dtype: the prefix view is already
+        // store-typed, and the fresh F32 K,V are cast down to it. Under FA this makes Kfull/Vfull F16 - half the
+        // transient concat working set, no large prefix cast, and FA consumes the F16 result directly (it would
+        // otherwise re-cast F32->F16 internally). to_store() is a no-op when the store is F32 (non-FA path
+        // unchanged, bit-identical). F32->F16 of the fresh tail matches FA's own rounding, so output is
+        // bit-identical to the prior F32-concat path.
+        // Reads the store type lazily: pkv_k is only populated inside the is_prefill/is_decode paths (the store
+        // is allocated on the first prefill), so to_store() must not touch it from the unified/reserve path. It
+        // is only ever called below within those guards, where the store is valid.
+        const auto to_store = [&](ggml_tensor * t) {
+            const ggml_type st = dmodel.pkv_k[il]->type;
+            return t->type == st ? t : ggml_cast(ctx0, t, st);
         };
 
         if (is_prefill) {
@@ -534,8 +541,8 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
                                                 dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], 0);
                 ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, prefill_off,
                                                 dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], 0);
-                Kfull = ggml_concat(ctx0, cast_kv(pk), Kcur, 2);
-                Vfull = ggml_concat(ctx0, cast_kv(pv), Vcur, 2);
+                Kfull = ggml_concat(ctx0, pk, to_store(Kcur), 2);
+                Vfull = ggml_concat(ctx0, pv, to_store(Vcur), 2);
             }
             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
                              Qcur, Kfull, Vfull, nullptr, nullptr, nullptr,
@@ -546,8 +553,8 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
                                             dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], 0);
             ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, P,
                                             dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], 0);
-            ggml_tensor * Kfull = ggml_concat(ctx0, cast_kv(pk), Kcur, 2);
-            ggml_tensor * Vfull = ggml_concat(ctx0, cast_kv(pv), Vcur, 2);
+            ggml_tensor * Kfull = ggml_concat(ctx0, pk, to_store(Kcur), 2);
+            ggml_tensor * Vfull = ggml_concat(ctx0, pv, to_store(Vcur), 2);
             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
                              Qcur, Kfull, Vfull, nullptr, nullptr, nullptr,
                              hparams.f_attention_scale, il);
