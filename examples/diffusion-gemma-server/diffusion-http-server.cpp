@@ -333,11 +333,15 @@ int main(int argc, char ** argv) {
     }
     const bool one_gpu = (gpu_devs <= 1);
 
+    // Causal prefill runs in chunks of this many tokens (one llama_decode each). The compute buffer is sized
+    // by the worst-case reserve at n_tokens = min(n_ctx, n_ubatch), so capping n_ubatch here - not n_ctx -
+    // decouples the activation buffer from the prompt length. Must be >= canvas_length (the DECODE batch).
+    const int prefill_chunk = 2048;
     auto make_cparams = [&](int n) {
         llama_context_params c = llama_context_default_params();
         c.n_ctx    = (uint32_t) n;
         c.n_batch  = (uint32_t) n;
-        c.n_ubatch = (uint32_t) n;  // non-causal: the whole [prompt | canvas] must fit one ubatch
+        c.n_ubatch = (uint32_t) std::min(n, prefill_chunk);  // chunked causal prefill: one chunk per ubatch
         // Cap outputs to the canvas: the decoder only reads canvas-row logits, so encode() need not reserve an
         // [n_ctx, n_vocab] buffer (~1 MB/token at a 262k vocab). Lets context scale past the old ~8-12k ceiling.
         c.n_outputs_max = (uint32_t) st.canvas_length;
@@ -362,6 +366,17 @@ int main(int argc, char ** argv) {
     const size_t weights    = llama_model_size(model);
     const size_t ram_budget = r_free > weights ? (size_t) ((r_free - weights) * 0.7) : 0;
 
+    // The prompt-KV store (per_tok x N, device-resident, F16 under FA) is allocated lazily at first prefill -
+    // AFTER llama_init_from_model - so a context that loads can still OOM on a full-length prompt. It is now
+    // the dominant runtime allocation (the activation buffer is chunked), so size context against it: require
+    // the store for an N-token prompt to fit in the GPU free space measured after the context is created.
+    const size_t pkv_per_tok  = llama_diffusion_pkv_bytes_per_token(model, args.fa);
+    // Headroom beyond weights + store(N) for allocations the probe can't see at init: the F32 concat working
+    // set (prefix cast + Kfull/Vfull at sequence length) and the self-conditioning buffers (sc_embT ~n_vocab x
+    // n_embd F16, sc_dev ~n_vocab x canvas F32) - empirically ~3.5 GB near the ceiling. Generous so the
+    // advertised ctx survives a full-length prompt rather than OOMing on it.
+    const size_t vram_headroom = std::max(v_total ? (size_t) (v_total * 0.15) : 0, (size_t) 4096 * 1024 * 1024);
+
     auto probe = [&](int ceil_ctx, size_t budget, size_t gpu_headroom, int * out_n) -> llama_context * {
         for (int raw : cands) {
             if (raw > ceil_ctx) continue;
@@ -374,9 +389,10 @@ int main(int argc, char ** argv) {
             }
             llama_context * c = llama_init_from_model(model, make_cparams(N));
             if (!c) continue;
-            if (gpu_headroom && gpu_dev) {
+            if (gpu_dev) {  // reject if the lazily-grown store + headroom won't fit GPU free space
                 size_t f = 0, t = 0; ggml_backend_dev_memory(gpu_dev, &f, &t);
-                if (f < gpu_headroom) { llama_free(c); continue; }
+                const size_t need = pkv_per_tok * (size_t) N + std::max(gpu_headroom, vram_headroom);
+                if (f < need) { llama_free(c); continue; }
             }
             *out_n = N;
             return c;
@@ -386,23 +402,26 @@ int main(int argc, char ** argv) {
 
     llama_context * ctx = nullptr;
     const char * reason = "auto";
-    if (args.ctx > 0) {  // explicit budget: honour exactly if it fits, else degrade through the probe
+    if (args.ctx > 0) {  // explicit budget: honour exactly if it fits (store included), else degrade via probe
         const double sc     = (double) n_head * (double) args.ctx * (double) args.ctx * 4.0;
         const size_t budget = std::max(v_free, ram_budget);
         if (args.fa || !budget || sc <= (double) budget * 0.9) {  // FA off: gate on the fp32 scores estimate
             ctx = llama_init_from_model(model, make_cparams(args.ctx));
+            if (ctx && gpu_dev) {  // ensure the prompt-KV store for args.ctx tokens also fits
+                size_t f = 0, t = 0; ggml_backend_dev_memory(gpu_dev, &f, &t);
+                if (f < pkv_per_tok * (size_t) args.ctx + vram_headroom) { llama_free(ctx); ctx = nullptr; }
+            }
             if (ctx) { st.maxtok = args.ctx; reason = "requested"; }
         }
     }
     if (!ctx) {
-        const int    ceil_ctx      = args.ctx > 0 ? std::min(auto_ceil, args.ctx) : auto_ceil;
-        const size_t vram_headroom = v_total ? (size_t) (v_total * 0.08) : (size_t) 1536 * 1024 * 1024;
+        const int ceil_ctx = args.ctx > 0 ? std::min(auto_ceil, args.ctx) : auto_ceil;
         int n1 = 0;
         ctx = probe(ceil_ctx, v_free, vram_headroom, &n1);
         if (ctx) { st.maxtok = n1; reason = "vram"; }
         if ((!ctx || n1 < ceil_ctx) && ram_budget > v_free) {
             int n2 = 0;
-            llama_context * c = probe(ceil_ctx, ram_budget, 0, &n2);
+            llama_context * c = probe(ceil_ctx, ram_budget, vram_headroom, &n2);
             if (c && n2 > st.maxtok) { if (ctx) llama_free(ctx); ctx = c; st.maxtok = n2; reason = "ram"; }
             else if (c) { llama_free(c); }
         }
