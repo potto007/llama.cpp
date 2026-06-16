@@ -501,7 +501,9 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
             batch.pos[i]       = i;
             batch.n_seq_id[i]  = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i]    = 1;  // encode() forces all rows to output anyway; set them so it stays quiet
+            // PREFILL logits are discarded (only the in-graph K,V store matters). Flag one row so a capped
+            // n_outputs_max reserves a single row, not an [n_input, n_vocab] buffer.
+            batch.logits[i]    = (i == n_input - 1) ? 1 : 0;
         }
         if (llama_decode(ctx, batch) != 0) {
             LOG_ERR("%s: PREFILL decode failed\n", __func__);

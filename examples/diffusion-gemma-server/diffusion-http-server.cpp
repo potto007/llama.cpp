@@ -338,6 +338,9 @@ int main(int argc, char ** argv) {
         c.n_ctx    = (uint32_t) n;
         c.n_batch  = (uint32_t) n;
         c.n_ubatch = (uint32_t) n;  // non-causal: the whole [prompt | canvas] must fit one ubatch
+        // Cap outputs to the canvas: the decoder only reads canvas-row logits, so encode() need not reserve an
+        // [n_ctx, n_vocab] buffer (~1 MB/token at a 262k vocab). Lets context scale past the old ~8-12k ceiling.
+        c.n_outputs_max = (uint32_t) st.canvas_length;
         c.no_perf  = true;
         c.flash_attn_type = args.fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         return c;
