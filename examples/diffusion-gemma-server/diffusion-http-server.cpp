@@ -17,6 +17,7 @@
 #include "llama.h"
 #include "ggml-backend.h"
 #include "common.h"
+#include "log.h"
 #include "chat.h"
 #include "../diffusion/diffusion.h"
 
@@ -117,6 +118,11 @@ static gen_result run_generation(server_state & st, const std::string & prompt, 
     const int P = (int) prefix.size();
     std::vector<llama_token> response;  // cumulative committed canvas tokens across blocks
 
+    // per-request instrumentation, summed across blocks
+    diffusion_eb_stats agg{};
+    int           blocks_run  = 0;   // blocks actually denoised (full canvas each)
+    const int64_t t_req_start = ggml_time_us();
+
     for (int b = 0; b < std::max(1, n_blocks); b++) {
         const int32_t prefix_len = (int32_t) prefix.size();
         const int32_t max_length = prefix_len + (int32_t) st.canvas_length;
@@ -136,7 +142,13 @@ static gen_result run_generation(server_state & st, const std::string & prompt, 
         eb.seed       = seed + b;  // deterministic, distinct per block
 
         int32_t n_generated = 0;
-        diffusion_generate_entropy_bound(st.ctx, prefix.data(), st.output_tokens.data(), prefix_len, eb, n_generated);
+        diffusion_eb_stats bs{};
+        diffusion_generate_entropy_bound(st.ctx, prefix.data(), st.output_tokens.data(), prefix_len, eb, n_generated, &bs);
+        agg.prefill_us       += bs.prefill_us;
+        agg.denoise_us       += bs.denoise_us;
+        agg.n_steps          += bs.n_steps;
+        agg.n_prefill_chunks += bs.n_prefill_chunks;
+        blocks_run++;
         if (n_generated <= prefix_len) {
             if (b == 0) {
                 r.http_status = 500;
@@ -162,6 +174,31 @@ static gen_result run_generation(server_state & st, const std::string & prompt, 
     r.text         = common_detokenize(st.vocab, response, /*special*/ false);
     r.prompt_n     = P;
     r.completion_n = (int) response.size();
+
+    // per-request perf summary: PREFILL (prompt -> KV store) and DENOISE (canvas steps) are timed separately
+    // because end-to-end latency is dominated by the adaptive step count, not the output length.
+    const double total_ms   = (ggml_time_us() - t_req_start) / 1e3;
+    const double prefill_ms = agg.prefill_us / 1e3;
+    const double denoise_ms = agg.denoise_us / 1e3;
+    const double ms_step    = agg.n_steps > 0 ? denoise_ms / agg.n_steps : 0.0;
+    const int    canvas_n   = blocks_run * (int) st.canvas_length;  // raw canvas tokens resolved (pre-trim)
+    // Throughputs, each measuring a distinct thing:
+    //   prefill = prompt tokens / prefill time            (input processing)
+    //   denoise = committed output tokens / denoise time  (effective generation rate)
+    //   canvas  = raw canvas tokens / denoise time         (raw work the denoiser does, most of it trimmed)
+    //   output  = committed output tokens / total time     (effective end-to-end useful output)
+    //   overall = (prompt + output) tokens / total time    (all tokens touched per wall-second)
+    const double pp_tps      = prefill_ms > 0 ? P              / (prefill_ms / 1e3) : 0.0;
+    const double denoise_tps = denoise_ms > 0 ? r.completion_n / (denoise_ms / 1e3) : 0.0;
+    const double canvas_tps  = denoise_ms > 0 ? canvas_n       / (denoise_ms / 1e3) : 0.0;
+    const double output_tps  = total_ms   > 0 ? r.completion_n / (total_ms   / 1e3) : 0.0;
+    const double overall_tps = total_ms   > 0 ? (P + r.completion_n) / (total_ms / 1e3) : 0.0;
+    LOG_INF("request: prompt=%d compl=%d canvas=%d blocks=%d | prefill %.0f ms (%d chunks) | "
+            "denoise %.0f ms (%d steps, %.1f ms/step) | total %.0f ms | "
+            "tok/s prefill=%.0f denoise=%.1f canvas=%.0f output=%.1f overall=%.0f\n",
+            P, r.completion_n, canvas_n, std::max(1, n_blocks), prefill_ms, agg.n_prefill_chunks,
+            denoise_ms, agg.n_steps, ms_step, total_ms,
+            pp_tps, denoise_tps, canvas_tps, output_tps, overall_tps);
     return r;
 }
 
@@ -273,6 +310,14 @@ static bool parse_args(int argc, char ** argv, cli_args & a) {
     return !a.model.empty();
 }
 
+// llama logs at DEBUG every llama_decode that redirects to encode() (this diffusion model has no KV memory, so
+// every prefill chunk and denoise step hits it) - tens of lines per request. Drop DEBUG; keep INFO/WARN/ERROR.
+static void server_llama_log(ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (level == GGML_LOG_LEVEL_DEBUG) { return; }
+    fputs(text, stderr);
+    fflush(stderr);
+}
+
 // ----------------------------------------------------------------------------- main
 int main(int argc, char ** argv) {
     cli_args args;
@@ -288,6 +333,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_log_set(server_llama_log, nullptr);  // filter llama's per-eval DEBUG spam (encode() redirect)
     llama_backend_init();
     ggml_backend_load_all();  // load dynamic backends so -ngl can offload to GPU
 

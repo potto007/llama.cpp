@@ -87,9 +87,20 @@ struct diffusion_eb_params {
     bool                      visual_mode             = false;
 };
 
+// Optional per-call timing breakdown, filled when a non-null pointer is passed to the generator. Lets callers
+// separate prompt PREFILL cost from the denoising loop (and see how many steps the adaptive stopper actually
+// ran), which end-to-end wall-clock cannot - generation time is dominated by step count, not output length.
+struct diffusion_eb_stats {
+    int64_t prefill_us       = 0;  // chunked prompt-KV prefill (0 when kv_cache is off)
+    int64_t denoise_us       = 0;  // denoising loop (all steps run)
+    int32_t n_steps          = 0;  // denoising steps actually executed (<= max_denoising_steps)
+    int32_t n_prefill_chunks = 0;  // ubatch-sized prefill chunks
+};
+
 void diffusion_generate_entropy_bound(llama_context *             ctx,
                                       const llama_token *         input_tokens,
                                       llama_token *               output_tokens,
                                       int32_t                     n_input,
                                       const diffusion_eb_params & params,
-                                      int32_t &                   n_generated);
+                                      int32_t &                   n_generated,
+                                      diffusion_eb_stats *        stats = nullptr);

@@ -444,8 +444,10 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
                                       llama_token *               output_tokens,
                                       int32_t                     n_input,
                                       const diffusion_eb_params & params,
-                                      int32_t &                   n_generated) {
+                                      int32_t &                   n_generated,
+                                      diffusion_eb_stats *        stats) {
     n_generated = 0;
+    if (stats) { *stats = diffusion_eb_stats{}; }
     if (!ctx || !input_tokens || !output_tokens || n_input <= 0 || params.max_length <= n_input) {
         return;
     }
@@ -499,8 +501,10 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
         // (the worst-case reserve), so chunking decouples it from the prompt length. One decode per chunk keeps
         // n_tokens <= n_ubatch, satisfying encode()'s assert without a giant single-shot ubatch.
         const int32_t U = std::max(1, (int32_t) llama_n_ubatch(ctx));
+        const int64_t t_prefill_start = ggml_time_us();
         bool prefill_ok = true;
         for (int32_t s = 0; s < n_input && prefill_ok; s += U) {
+            if (stats) { stats->n_prefill_chunks++; }
             const int32_t u = std::min(U, n_input - s);
             llama_diffusion_set_phase(model, /*PKV_PREFILL=*/1, n_input, /*off=*/s);
             batch.n_tokens = u;
@@ -523,15 +527,20 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
             llama_batch_free(batch);
             return;
         }
+        if (stats) { stats->prefill_us = ggml_time_us() - t_prefill_start; }
     }
+
+    const int64_t t_denoise_start = ggml_time_us();
 
     float   prev_temp_inv = 1.0f;
     int     held          = 0;
     bool    finished      = false;
     bool    device_sample_ok = gpu_sample_reduce;   // latched off if a backend (e.g. Metal) can't device-sample
 
+    int32_t steps_run = 0;
     for (int32_t cur_step = S; cur_step >= 1 && !finished; --cur_step) {
         const int32_t step_idx = S - cur_step;                    // 0-based
+        steps_run++;
         const float   t        = params.t_min + (params.t_max - params.t_min) * ((float) cur_step / (float) S);
         const float   temp_inv = 1.0f / t;
 
@@ -673,6 +682,11 @@ void diffusion_generate_entropy_bound(llama_context *             ctx,
             !params.step_callback(step_idx, S, output_tokens, params.max_length, params.step_callback_user_data)) {
             break;
         }
+    }
+
+    if (stats) {
+        stats->denoise_us = ggml_time_us() - t_denoise_start;
+        stats->n_steps    = steps_run;
     }
 
     if (params.kv_cache) {
