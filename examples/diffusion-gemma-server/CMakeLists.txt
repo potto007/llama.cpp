@@ -11,3 +11,11 @@ install(TARGETS ${TARGET} RUNTIME)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../diffusion)
 target_link_libraries(${TARGET} PRIVATE llama-diffusion llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# HTTP server: OpenAI-compatible /v1/chat/completions over the entropy-bound decoder.
+set(TARGET llama-diffusion-server)
+add_executable(${TARGET} diffusion-http-server.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../diffusion)
+target_link_libraries(${TARGET} PRIVATE llama-diffusion llama cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
