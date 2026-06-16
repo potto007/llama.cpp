@@ -66,43 +66,12 @@ static size_t trim_canvas(const llama_vocab * vocab, const llama_token * canvas,
     return cut;
 }
 
-// DiffusionGemma wraps its chain-of-thought in channel markers and puts the user-facing answer after the
-// final one, e.g.  "<|channel>thought\n...reasoning...<channel|>The answer."  These render as plain text
-// (they are model-specific tokens, not standard special tokens), so a chat client sees the reasoning inline.
-// Split the raw text into {reasoning, content}: content is everything after the LAST close marker; reasoning
-// is what precedes it with the leading open marker stripped. If no marker is present, it's all content.
-struct split_text {
-    std::string reasoning;
-    std::string content;
-};
-
-static std::string strip_ws(const std::string & s) {
-    const size_t b = s.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return "";
-    const size_t e = s.find_last_not_of(" \t\r\n");
-    return s.substr(b, e - b + 1);
-}
-
-static split_text split_channels(const std::string & raw) {
-    static const std::string close = "<channel|>";
-    static const std::string open  = "<|channel>";
-    split_text r;
-    const size_t pos = raw.rfind(close);
-    if (pos == std::string::npos) {
-        // no close marker: if a lone open marker leaked, drop everything up to it; else it's all content
-        const size_t op = raw.find(open);
-        r.content = strip_ws(op == std::string::npos ? raw : raw.substr(0, op));
-        return r;
-    }
-    r.content = strip_ws(raw.substr(pos + close.size()));
-    std::string reasoning = raw.substr(0, pos);
-    const size_t op = reasoning.find(open);
-    if (op != std::string::npos) reasoning = reasoning.substr(op + open.size());
-    // the open marker is usually followed by a channel name ("thought"); drop a leading bare word
-    reasoning = strip_ws(reasoning);
-    r.reasoning = reasoning;
-    return r;
-}
+// DiffusionGemma wraps its chain-of-thought in channel markers and emits tool calls inline, e.g.
+//   "<|channel>thought\n...reasoning...<channel|><|tool_call>call:NAME{args}<tool_call|>"
+// These render as plain text (model-specific tokens, not standard special tokens), so without parsing a chat
+// client sees the reasoning and tool-call markup verbatim. We hand the raw answer to common_chat_parse() with
+// the PEG parser common_chat_templates_apply() derived from the GGUF's own template, which splits it into
+// {content, reasoning_content, tool_calls} - exactly as llama-server does for autoregressive models.
 
 // ----------------------------------------------------------------------------- server state (one model)
 struct server_state {
@@ -114,8 +83,10 @@ struct server_state {
     int                       maxtok        = 0;
     diffusion_eb_params       base;
     std::string               model_id;
-    bool                      strip_channels = true;   // split off the <|channel>thought...<channel|> reasoning
-    bool                      show_reasoning = false;  // surface it as reasoning_content instead of dropping it
+    // AUTO: parse the <|channel>thought...<channel|> block out as reasoning_content. NONE (--raw): leave the
+    // markers inline in content. Tool calls are parsed in either case.
+    common_reasoning_format   reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    bool                      show_reasoning = false;  // surface the parsed reasoning as reasoning_content
     std::vector<llama_token>  output_tokens;  // reused under gen_mtx
     std::mutex                gen_mtx;         // ctx is single + not thread-safe: serialize generation
 };
@@ -130,24 +101,13 @@ struct gen_result {
 };
 
 // Run the block-diffusion loop for one chat request. on_progress (optional) is called with the full raw
-// answer text after each committed block, so a streaming caller can split + diff it. gen_mtx must be held.
-static gen_result run_generation(server_state & st, const json & messages, int seed, int n_blocks,
+// answer text after each committed block, so a streaming caller can parse + diff it. gen_mtx must be held.
+static gen_result run_generation(server_state & st, const std::string & prompt, int seed, int n_blocks,
                                  const std::function<void(const std::string &)> & on_progress) {
     gen_result r;
 
-    std::vector<llama_token> prefix;
-    try {
-        std::vector<common_chat_msg> msgs = common_chat_msgs_parse_oaicompat(messages);
-        common_chat_templates_inputs inputs;
-        inputs.messages              = msgs;
-        inputs.add_generation_prompt = true;
-        const std::string prompt = common_chat_templates_apply(st.chat_templates.get(), inputs).prompt;
-        prefix = common_tokenize(st.vocab, prompt, /*add special*/ true, /*parse special*/ true);
-    } catch (const std::exception & e) {
-        r.http_status = 400;
-        r.err = std::string("failed to apply chat template: ") + e.what();
-        return r;
-    }
+    std::vector<llama_token> prefix =
+        common_tokenize(st.vocab, prompt, /*add special*/ true, /*parse special*/ true);
     if (prefix.empty()) {
         r.http_status = 400;
         r.err = "empty prompt after templating";
@@ -214,6 +174,59 @@ static std::string new_id(const char * prefix) {
 
 static json error_json(const std::string & msg, const char * type) {
     return json{ { "error", { { "message", msg }, { "type", type }, { "code", nullptr } } } };
+}
+
+// The gemma4 template emits no tool-call ids, but OpenAI clients key results by id. Assign stable ones by index.
+static void assign_tool_call_ids(common_chat_msg & msg) {
+    for (auto & tc : msg.tool_calls) {
+        if (tc.id.empty()) tc.id = new_id("call_");
+    }
+}
+
+// Build the OpenAI assistant message from a parsed answer. content is null (not "") when the turn is purely
+// tool calls, matching the OpenAI schema. reasoning_content is only surfaced when --show-reasoning is set.
+static json parsed_message_to_oai(const common_chat_msg & m, bool show_reasoning) {
+    json msg = { { "role", "assistant" } };
+    msg["content"] = (m.content.empty() && !m.tool_calls.empty()) ? json(nullptr) : json(m.content);
+    if (show_reasoning && !m.reasoning_content.empty()) {
+        msg["reasoning_content"] = m.reasoning_content;
+    }
+    if (!m.tool_calls.empty()) {
+        json calls = json::array();
+        for (const auto & tc : m.tool_calls) {
+            calls.push_back(json{ { "id", tc.id },
+                                  { "type", "function" },
+                                  { "function", { { "name", tc.name }, { "arguments", tc.arguments } } } });
+        }
+        msg["tool_calls"] = calls;
+    }
+    return msg;
+}
+
+// Convert one incremental parse diff into an OpenAI streaming delta (mirrors server-chat.cpp).
+static json diff_to_delta_oai(const common_chat_msg_diff & d, bool show_reasoning) {
+    json delta = json::object();
+    if (show_reasoning && !d.reasoning_content_delta.empty()) {
+        delta["reasoning_content"] = d.reasoning_content_delta;
+    }
+    if (!d.content_delta.empty()) {
+        delta["content"] = d.content_delta;
+    }
+    if (d.tool_call_index != std::string::npos) {
+        json tc = { { "index", d.tool_call_index } };
+        if (!d.tool_call_delta.id.empty()) {
+            tc["id"]   = d.tool_call_delta.id;
+            tc["type"] = "function";
+        }
+        if (!d.tool_call_delta.name.empty() || !d.tool_call_delta.arguments.empty()) {
+            json fn = json::object();
+            if (!d.tool_call_delta.name.empty())      fn["name"]      = d.tool_call_delta.name;
+            if (!d.tool_call_delta.arguments.empty()) fn["arguments"] = d.tool_call_delta.arguments;
+            tc["function"] = fn;
+        }
+        delta["tool_calls"] = json::array({ tc });
+    }
+    return delta;
 }
 
 // ----------------------------------------------------------------------------- arg parsing
@@ -283,7 +296,7 @@ int main(int argc, char ** argv) {
 
     server_state st;
     st.model = model;
-    st.strip_channels = !args.raw;
+    st.reasoning_format = args.raw ? COMMON_REASONING_FORMAT_NONE : COMMON_REASONING_FORMAT_AUTO;
     st.show_reasoning = args.show_reasoning;
     st.vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(st.vocab);
@@ -503,23 +516,59 @@ int main(int argc, char ** argv) {
                            : 1;
         }
 
+        // Apply the chat template WITH the request's tools so the prompt advertises them, and capture the PEG
+        // parser/format common_chat derives from the GGUF's own template. The same machinery powers llama-server:
+        // it turns the model's inline <|tool_call>call:NAME{...}<tool_call|> and <|channel>thought...<channel|>
+        // markup back into structured tool_calls + reasoning_content instead of leaking it as plain text.
+        std::string        prompt;
+        common_chat_params cp;
+        try {
+            common_chat_templates_inputs inputs;
+            inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
+            inputs.add_generation_prompt = true;
+            inputs.reasoning_format      = st.reasoning_format;
+            if (body.contains("tools") && !body.at("tools").is_null()) {
+                inputs.tools = common_chat_tools_parse_oaicompat(body.at("tools"));
+            }
+            if (body.contains("tool_choice") && body.at("tool_choice").is_string()) {
+                inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(body.at("tool_choice").get<std::string>());
+            }
+            inputs.parallel_tool_calls = body.value("parallel_tool_calls", false);
+            cp     = common_chat_templates_apply(st.chat_templates.get(), inputs);
+            prompt = cp.prompt;
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(error_json(std::string("failed to apply chat template: ") + e.what(),
+                                       "invalid_request_error").dump(), "application/json");
+            return;
+        }
+
         const std::string id      = new_id("chatcmpl-");
         const long        created = (long) std::time(nullptr);
 
+        // Build the per-message parser from the template's derived parser. Held by value so the streaming
+        // provider (which may run after this handler returns) keeps a valid copy.
+        auto make_parser = [&st, cp]() {
+            common_chat_parser_params pp(cp);
+            pp.reasoning_format = st.reasoning_format;
+            pp.parser.load(cp.parser);
+            return pp;
+        };
+
         if (!stream) {
             std::lock_guard<std::mutex> lock(st.gen_mtx);
-            gen_result r = run_generation(st, messages, seed, n_blocks, nullptr);
+            gen_result r = run_generation(st, prompt, seed, n_blocks, nullptr);
             if (!r.ok) {
                 res.status = r.http_status;
                 res.set_content(error_json(r.err, r.http_status == 400 ? "invalid_request_error" : "server_error").dump(),
                                 "application/json");
                 return;
             }
-            const split_text sp = st.strip_channels ? split_channels(r.text) : split_text{ "", r.text };
-            json message = { { "role", "assistant" }, { "content", sp.content } };
-            if (st.show_reasoning && !sp.reasoning.empty()) {
-                message["reasoning_content"] = sp.reasoning;
-            }
+            common_chat_parser_params pp = make_parser();
+            common_chat_msg msg = common_chat_parse(r.text, /*is_partial*/ false, pp);
+            assign_tool_call_ids(msg);
+            json         message = parsed_message_to_oai(msg, st.show_reasoning);
+            const char * finish  = msg.tool_calls.empty() ? "stop" : "tool_calls";
             json resp = {
                 { "id", id },
                 { "object", "chat.completion" },
@@ -528,7 +577,7 @@ int main(int argc, char ** argv) {
                 { "choices", json::array({ json{
                       { "index", 0 },
                       { "message", message },
-                      { "finish_reason", "stop" } } }) },
+                      { "finish_reason", finish } } }) },
                 { "usage", { { "prompt_tokens", r.prompt_n },
                              { "completion_tokens", r.completion_n },
                              { "total_tokens", r.prompt_n + r.completion_n } } },
@@ -537,10 +586,10 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // streaming: SSE, one chat.completion.chunk per committed block, then [DONE]
+        // streaming: SSE, deltas emitted per committed block via incremental re-parse, then [DONE]
         res.set_chunked_content_provider(
             "text/event-stream",
-            [&st, messages, seed, n_blocks, id, created](size_t, httplib::DataSink & sink) {
+            [&st, prompt, seed, n_blocks, id, created, make_parser](size_t, httplib::DataSink & sink) {
                 auto send_chunk = [&](const json & delta, const char * finish) {
                     json chunk = {
                         { "id", id },
@@ -559,24 +608,23 @@ int main(int argc, char ** argv) {
                 std::lock_guard<std::mutex> lock(st.gen_mtx);
                 send_chunk(json{ { "role", "assistant" } }, nullptr);  // OpenAI's first delta carries the role
 
-                // emit only the new suffix of each field as the answer grows across blocks
-                std::string sent_content, sent_reasoning;
-                auto emit_field = [&](const char * field, const std::string & full, std::string & sent) {
-                    if (full.size() <= sent.size() || full.compare(0, sent.size(), sent) != 0) {
-                        if (full == sent) return;
-                        sent.clear();  // split point shifted: re-emit from scratch (rare; multi-block)
+                common_chat_parser_params pp = make_parser();
+                common_chat_msg          prev;            // baseline for diffing
+                std::vector<std::string> tc_ids;          // stable tool-call ids by index
+                auto gen_id     = [] { return new_id("call_"); };
+                auto emit_diffs = [&](common_chat_msg & cur) {
+                    cur.set_tool_call_ids(tc_ids, gen_id);
+                    for (const auto & d : common_chat_msg_diff::compute_diffs(prev, cur)) {
+                        const json delta = diff_to_delta_oai(d, st.show_reasoning);
+                        if (!delta.empty()) send_chunk(delta, nullptr);
                     }
-                    send_chunk(json{ { field, full.substr(sent.size()) } }, nullptr);
-                    sent = full;
+                    prev = cur;
                 };
-                gen_result r = run_generation(st, messages, seed, n_blocks,
+
+                gen_result r = run_generation(st, prompt, seed, n_blocks,
                     [&](const std::string & full_raw) {
-                        const split_text sp = st.strip_channels ? split_channels(full_raw)
-                                                                : split_text{ "", full_raw };
-                        if (st.show_reasoning && !sp.reasoning.empty()) {
-                            emit_field("reasoning_content", sp.reasoning, sent_reasoning);
-                        }
-                        emit_field("content", sp.content, sent_content);
+                        common_chat_msg cur = common_chat_parse(full_raw, /*is_partial*/ true, pp);
+                        emit_diffs(cur);
                     });
 
                 if (!r.ok) {
@@ -586,7 +634,9 @@ int main(int argc, char ** argv) {
                         "\n\n";
                     sink.write(err.data(), err.size());
                 } else {
-                    send_chunk(json::object(), "stop");
+                    common_chat_msg final_msg = common_chat_parse(r.text, /*is_partial*/ false, pp);
+                    emit_diffs(final_msg);  // flush any tail the partial parses withheld
+                    send_chunk(json::object(), final_msg.tool_calls.empty() ? "stop" : "tool_calls");
                 }
                 const std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
