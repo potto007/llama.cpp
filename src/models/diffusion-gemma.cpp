@@ -15,6 +15,11 @@
 //   3. attention mask: prompt causal over prompt only; canvas bidirectional over all prompt+canvas
 // The Gemma-4 backbone is identical to gemma4 (shared via gemma4-common.h).
 
+// CUDA flash-attn only serves the head-dim-512 global layers when the KV length is a multiple of
+// FATTN_KQ_STRIDE (256); otherwise they fall back to (slow, host) CPU flash-attn. The global layers read the
+// prompt-KV as a view padded up to this, with the pad rows masked to -inf. Must match ggml-cuda FATTN_KQ_STRIDE.
+static constexpr int64_t DG_FATTN_KV_PAD = 256;
+
 // Region-aware additive mask for the unified [prompt | canvas] forward. Prompt queries are causal
 // (SWA-clipped in sliding layers); canvas queries are bidirectional. Canvas->prompt reach: global
 // layers see all prompt, sliding layers only the last (n_swa-1) prompt positions.
@@ -108,7 +113,9 @@ public:
 };
 
 // Decode-phase mask (prompt-KV caching): canvas queries over [cached prompt (first P) | fresh canvas
-// (last C)], rectangular [P+C, C]. Global sees all prompt; sliding the last (n_swa-1) prompt.
+// (last C)]. SWA layers see only the last (n_swa-1) prompt positions, windowed to [swa_prefix_len()+C, C].
+// Global layers see the whole prompt, padded up to DG_FATTN_KV_PAD (so n_kv is a multiple of 256 for CUDA
+// flash-attn): [global_prompt_len()+C, C], with the [P, padded) pad rows masked to -inf.
 class llm_graph_input_attn_diffusion_decode : public llm_graph_input_attn_no_cache {
 public:
     llm_graph_input_attn_diffusion_decode(const llama_hparams & hparams, const llama_cparams & cparams,
@@ -116,27 +123,35 @@ public:
         llm_graph_input_attn_no_cache(hparams, cparams), n_prompt(n_prompt), n_canvas(n_canvas) {}
     ~llm_graph_input_attn_diffusion_decode() = default;
 
-    void set_input(const llama_ubatch * /*ubatch*/) override {
-        const int64_t P    = n_prompt;
-        const int64_t C    = n_canvas;
-        const int64_t n_kv = P + C;
-        const int64_t canvas_prompt_lo = P - (int64_t) hparams.n_swa + 1;
+    // SWA layers keep only the last (n_swa-1) prompt keys (every canvas query's window lower bound is the same
+    // flat canvas_prompt_lo = P-n_swa+1). The graph sizes the SWA mask and slices the prompt K/V to this length.
+    int64_t swa_prefix_len() const {
+        const int64_t win = hparams.n_swa > 0 ? (int64_t) hparams.n_swa - 1 : n_prompt;
+        return std::min<int64_t>(n_prompt, win);
+    }
+    // Global layers read the prompt padded to DG_FATTN_KV_PAD (keeps head-dim-512 flash-attn on the GPU). Only
+    // under flash-attn: the non-FA explicit path has no KV-length constraint, so it stays unpadded/unchanged.
+    int64_t global_prompt_len() const {
+        return GGML_PAD(n_prompt, cparams.flash_attn ? DG_FATTN_KV_PAD : (int64_t) 1);
+    }
 
+    void set_input(const llama_ubatch * /*ubatch*/) override {
+        const int64_t C = n_canvas;
+        const int64_t P = n_prompt;
+
+        // Every canvas query attends to every real key: global sees all prompt + canvas; an SWA layer's windowed
+        // prefix is *exactly* its allowed set (last n_swa-1 prompt keys) and the canvas (C < n_swa) is fully in
+        // window. So the mask is all-zero except the global pad rows [P, padded) (zeroed store positions), which
+        // are masked to -inf. This flat fill replaces an O(P*C) per-element llama_cast loop that dominated
+        // denoise latency at long context - the per-step mask build, not the GPU attention.
         const auto fill = [&](auto * data, bool swa) {
             using T = std::remove_reference_t<decltype(*data)>;
-            std::fill(data, data + n_kv * C, llama_cast<T>(-INFINITY));
-            for (int64_t q = 0; q < C; ++q) {            // canvas query (position P+q)
-                const uint64_t row = q * n_kv;
-                for (int64_t k = 0; k < n_kv; ++k) {     // key: k<P prompt (pos k), else canvas
-                    bool allow;
-                    if (k < P) {
-                        allow = swa ? (k >= canvas_prompt_lo) : true;
-                    } else {
-                        allow = true;                     // bidirectional over the canvas
-                    }
-                    if (allow) {
-                        data[row + k] = llama_cast<T>(0.0f);
-                    }
+            const int64_t pfx  = swa ? swa_prefix_len() : global_prompt_len();
+            const int64_t n_kv = pfx + C;
+            std::fill(data, data + n_kv * C, llama_cast<T>(0.0f));
+            if (!swa && pfx > P) {                      // mask the global [P, padded) pad rows in every row
+                for (int64_t q = 0; q < C; ++q) {
+                    std::fill(data + q * n_kv + P, data + q * n_kv + pfx, llama_cast<T>(-INFINITY));
                 }
             }
         };
@@ -164,8 +179,9 @@ public:
 };
 
 // Chunked-prefill mask: a chunk of n_q prompt queries at global positions [off, off+n_q) attends causally
-// over keys [0, off+n_q) (prior chunks already in the store + this chunk). Rectangular [n_kv=off+n_q, n_q].
-// Pure causal (global) / causal + sliding window (SWA); off=0 reduces to the single-shot causal prefill.
+// over keys [0, off+n_q) (prior chunks already in the store + this chunk). Global layers see the full prefix
+// (rectangular [n_kv=off+n_q, n_q]); SWA layers only ever reach the last (n_swa-1) prefix keys, so their mask
+// (and prefix K/V view) is windowed to [n_kv=swa_prefix_len()+n_q, n_q]. off=0 reduces to single-shot causal.
 class llm_graph_input_attn_diffusion_prefill : public llm_graph_input_attn_no_cache {
 public:
     llm_graph_input_attn_diffusion_prefill(const llama_hparams & hparams, const llama_cparams & cparams,
@@ -173,19 +189,37 @@ public:
         llm_graph_input_attn_no_cache(hparams, cparams), off(off), n_q(n_q) {}
     ~llm_graph_input_attn_diffusion_prefill() = default;
 
+    // SWA layers keep only the last (n_swa-1) prefix keys: any key below off-(n_swa-1) is outside every chunk
+    // query's window. The graph sizes the SWA mask and slices the SWA prefix K/V view to this same length.
+    int64_t swa_prefix_len() const {
+        const int64_t win = hparams.n_swa > 0 ? (int64_t) hparams.n_swa - 1 : off;
+        return std::min<int64_t>(off, win);
+    }
+    // Global layers pad n_kv up to DG_FATTN_KV_PAD (keeps head-dim-512 flash-attn on the GPU). The pad keys
+    // [off+n_q, padded) are non-causal for every query, so the causal fill below leaves them at -inf for free.
+    int64_t global_kv_len() const {
+        return GGML_PAD(off + n_q, cparams.flash_attn ? DG_FATTN_KV_PAD : (int64_t) 1);
+    }
+
     void set_input(const llama_ubatch * /*ubatch*/) override {
-        const int64_t n_kv = off + n_q;
         const auto fill = [&](auto * data, bool swa) {
             using T = std::remove_reference_t<decltype(*data)>;
+            const int64_t pfx  = swa ? swa_prefix_len() : off; // prefix keys present in this mask's K/V
+            const int64_t lo   = off - pfx;                    // global pos of the first prefix key
+            const int64_t n_kv = swa ? (pfx + n_q) : global_kv_len();
             std::fill(data, data + n_kv * n_q, llama_cast<T>(-INFINITY));
             for (int64_t i = 0; i < n_q; ++i) {        // query local i -> global position off+i
                 const int64_t  q   = off + i;
                 const uint64_t row = i * n_kv;
-                for (int64_t k = 0; k <= q; ++k) {     // causal: keys [0, q]
+                for (int64_t j = 0; j < n_kv; ++j) {   // key local j -> global pos: prefix [lo,off) then chunk [off,..)
+                    const int64_t k = (j < pfx) ? (lo + j) : (off + (j - pfx));
+                    if (k > q) {                        // causal
+                        continue;
+                    }
                     if (swa && llama_hparams::is_masked_swa(hparams.n_swa, hparams.swa_type, k, q)) {
                         continue;                       // sliding layers clip keys outside the window
                     }
-                    data[row + k] = llama_cast<T>(0.0f);
+                    data[row + j] = llama_cast<T>(0.0f);
                 }
             }
         };
@@ -367,6 +401,11 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
     // keys span [0, prefill_off + n_tokens) (prior chunks live in the store, this chunk is fresh).
     const int64_t prefill_off = is_prefill ? dmodel.pkv_prefill_off : 0;
 
+    // SWA prefill layers only read the last (n_swa-1) prefix keys; this bounds their prefix view (and SWA mask,
+    // sized above) to O(n_swa) instead of the full O(prefill_off). Must match prefill mask swa_prefix_len().
+    const int64_t swa_win    = hparams.n_swa > 0 ? (int64_t) hparams.n_swa - 1 : prefill_off;
+    const int64_t swa_prefix = std::min<int64_t>(prefill_off, swa_win);
+
     // Allocate the store on the first PREFILL chunk, sized to the whole prompt (pkv_P). Type follows FA so it
     // is precision-neutral: under FA, build_attn casts K,V to F16 regardless. DECODE only reads a prior store.
     if (is_prefill && dmodel.pkv_P > 0) {
@@ -454,25 +493,27 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
     const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
     llm_graph_input_attn_no_cache * inp_attn = nullptr;
     if (is_decode) {
-        const int64_t n_kv = P + C;
         auto uptr = std::make_unique<llm_graph_input_attn_diffusion_decode>(hparams, cparams, P, C);
+        const int64_t n_kv     = uptr->global_prompt_len() + C;  // global layers: prompt padded to 256
+        const int64_t n_kv_swa = uptr->swa_prefix_len() + C;     // SWA layers: windowed prompt
         uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, C, 1, 1);
         ggml_set_input(uptr->self_kq_mask);
         uptr->self_kq_mask_cnv = uptr->self_kq_mask;
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-            uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, C, 1, 1);
+            uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv_swa, C, 1, 1);
             ggml_set_input(uptr->self_kq_mask_swa);
             uptr->self_kq_mask_swa_cnv = uptr->self_kq_mask_swa;
         }
         inp_attn = (llm_graph_input_attn_no_cache *) res->add_input(std::move(uptr));
     } else if (is_prefill) {
-        const int64_t n_kv = prefill_off + n_tokens;
         auto uptr = std::make_unique<llm_graph_input_attn_diffusion_prefill>(hparams, cparams, prefill_off, n_tokens);
+        const int64_t n_kv     = uptr->global_kv_len();             // global layers: full prefix padded to 256
+        const int64_t n_kv_swa = uptr->swa_prefix_len() + n_tokens; // SWA layers: windowed prefix
         uptr->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
         ggml_set_input(uptr->self_kq_mask);
         uptr->self_kq_mask_cnv = uptr->self_kq_mask;
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-            uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
+            uptr->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv_swa, n_tokens, 1, 1);
             ggml_set_input(uptr->self_kq_mask_swa);
             uptr->self_kq_mask_swa_cnv = uptr->self_kq_mask_swa;
         }
@@ -532,27 +573,62 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
                                             dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], voff);
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, sk));   // F32 -> store type (F16/F32)
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, sv));
-            // Attend causally over [0, prefill_off+n_tokens): prepend the prior chunks' cached K,V (written by
-            // earlier llama_decode calls) to this chunk's fresh K,V. First chunk (off=0) needs no prefix.
+            // Attend causally over the prefix + this chunk's fresh K,V. Global layers prepend the full prefix
+            // [0, prefill_off); SWA layers only the sliding window [prefill_off-swa_prefix, prefill_off) - every
+            // key below that is outside the window of even the earliest chunk query. First chunk needs no prefix.
             ggml_tensor * Kfull = Kcur;
             ggml_tensor * Vfull = Vcur;
-            if (prefill_off > 0) {
-                ggml_tensor * pk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv, prefill_off,
-                                                dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], 0);
-                ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, prefill_off,
-                                                dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], 0);
+            const bool    layer_swa = hparams.is_swa(il);
+            const int64_t pfx_len = layer_swa ? swa_prefix : prefill_off;
+            const int64_t pfx_off = prefill_off - pfx_len; // global pos of the first prefix key (0 for global)
+            if (pfx_len > 0) {
+                const size_t pkoff = (size_t) pfx_off * dmodel.pkv_k[il]->nb[2];
+                const size_t pvoff = (size_t) pfx_off * dmodel.pkv_v[il]->nb[2];
+                ggml_tensor * pk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv, pfx_len,
+                                                dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], pkoff);
+                ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, pfx_len,
+                                                dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], pvoff);
                 Kfull = ggml_concat(ctx0, pk, to_store(Kcur), 2);
                 Vfull = ggml_concat(ctx0, pv, to_store(Vcur), 2);
+            }
+            // Global layers (head dim 512): pad n_kv up to 256 so CUDA flash-attn serves this chunk (else CPU
+            // fallback - the dominant prefill cost on the unaligned final chunk). Pad rows come from the zeroed
+            // store tail [n_kv, padded) (disjoint from this chunk's write) and are masked to -inf in the mask.
+            const int64_t n_kv   = prefill_off + n_tokens;
+            const int64_t padded = cparams.flash_attn && !layer_swa ? GGML_PAD(n_kv, DG_FATTN_KV_PAD) : n_kv;
+            if (padded > n_kv) {
+                if (pfx_len == 0) {  // Kfull is still the raw F32 Kcur; match the store-typed pad views
+                    Kfull = to_store(Kcur);
+                    Vfull = to_store(Vcur);
+                }
+                const size_t padk = (size_t) n_kv * dmodel.pkv_k[il]->nb[2];
+                const size_t padv = (size_t) n_kv * dmodel.pkv_v[il]->nb[2];
+                ggml_tensor * pdk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv, padded - n_kv,
+                                                 dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], padk);
+                ggml_tensor * pdv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, padded - n_kv,
+                                                 dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], padv);
+                Kfull = ggml_concat(ctx0, Kfull, pdk, 2);
+                Vfull = ggml_concat(ctx0, Vfull, pdv, 2);
             }
             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
                              Qcur, Kfull, Vfull, nullptr, nullptr, nullptr,
                              hparams.f_attention_scale, il);
         } else if (is_decode) {
-            // DECODE: prepend cached prompt K,V (first P) to the fresh canvas K,V
-            ggml_tensor * pk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv, P,
-                                            dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], 0);
-            ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, P,
-                                            dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], 0);
+            // DECODE: prepend cached prompt K,V to the fresh canvas K,V. SWA layers prepend only the last
+            // (n_swa-1) prompt positions [P-swa_dec_prefix, P); global layers prepend the whole prompt, padded up
+            // to DG_FATTN_KV_PAD (so n_kv = pad+C is a multiple of 256 and CUDA flash-attn serves head dim 512).
+            // The [P, P_pad) pad rows are zeroed in the store and masked to -inf, so they do not affect output.
+            const int64_t dec_win    = hparams.n_swa > 0 ? (int64_t) hparams.n_swa - 1 : P;
+            const int64_t dec_pad    = cparams.flash_attn ? DG_FATTN_KV_PAD : (int64_t) 1; // no pad without FA
+            const int64_t dec_prefix = hparams.is_swa(il) ? std::min<int64_t>(P, dec_win)
+                                                          : GGML_PAD(P, dec_pad);
+            const int64_t dec_off    = hparams.is_swa(il) ? (P - dec_prefix) : 0; // SWA window start; global = 0
+            const size_t  pkoff = (size_t) dec_off * dmodel.pkv_k[il]->nb[2];
+            const size_t  pvoff = (size_t) dec_off * dmodel.pkv_v[il]->nb[2];
+            ggml_tensor * pk = ggml_view_3d(ctx0, dmodel.pkv_k[il], n_embd_head, n_head_kv, dec_prefix,
+                                            dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], pkoff);
+            ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, dec_prefix,
+                                            dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], pvoff);
             ggml_tensor * Kfull = ggml_concat(ctx0, pk, to_store(Kcur), 2);
             ggml_tensor * Vfull = ggml_concat(ctx0, pv, to_store(Vcur), 2);
             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
@@ -794,7 +870,11 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
     m.pkv_v.clear();
 
     const int     n_layer = (int) m.hparams.n_layer();
-    const int64_t cap     = P;
+    // Pad capacity to DG_FATTN_KV_PAD: the global layers (head dim 512) only get a CUDA flash-attn kernel when
+    // the KV length is a multiple of FATTN_KQ_STRIDE (256). Reading the prompt as a 256-padded view (tail rows
+    // masked to -inf) keeps their attention on the GPU instead of falling back to CPU flash-attn. See the
+    // is_decode / is_prefill global-layer branches and the masks.
+    const int64_t cap     = GGML_PAD(P, DG_FATTN_KV_PAD);
 
     ggml_init_params ip = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (2 * n_layer + 4),
@@ -819,6 +899,7 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
                                           : ggml_backend_cpu_buffer_type();
     m.pkv_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.pkv_ctx, buft);
     GGML_ASSERT(m.pkv_buf != nullptr);
+    ggml_backend_buffer_clear(m.pkv_buf, 0);  // zero the [P, cap) pad rows so padded global reads stay finite
     m.pkv_cap = cap;
 }
 
