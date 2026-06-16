@@ -8,7 +8,7 @@
 // (bidirectional attention over a fixed canvas, no KV reuse across tokens), which the router's slot/decode
 // machinery cannot drive. See examples/diffusion/diffusion.cpp for the decode loop.
 //
-// Usage: llama-diffusion-server -m <model.gguf> [--host H] [--port P] [-ngl N] [-c CTX] [--flash-attn] [-a ALIAS]
+// Usage: llama-diffusion-server -m <model.gguf> [--host H] [--port P] [-ngl N] [-c CTX] [--flash-attn] [-a ALIAS] [--vram-headroom safe|aggressive]
 //   ctx (-c) <= 0 auto-sizes the largest non-causal context that fits VRAM (else RAM), like the visual server.
 //
 // Request extensions beyond the OpenAI schema: "seed" (int, default 0) and "n_blocks" (int) which denoises
@@ -236,6 +236,7 @@ struct cli_args {
     int         port  = 8080;
     int         ngl   = 0;
     int         ctx   = 0;       // 0 = auto-size
+    bool        vram_aggressive = false;  // headroom pad: safe (0.135 / 4 GB) by default, aggressive (0.10 / 3 GB)
     bool        fa    = false;
     bool        raw   = false;            // keep the <|channel> reasoning markers in content
     bool        show_reasoning = false;   // surface reasoning as reasoning_content
@@ -256,6 +257,11 @@ static bool parse_args(int argc, char ** argv, cli_args & a) {
         else if (s == "--port")                       { const char * v = next("--port"); if (!v) return false; a.port = atoi(v); }
         else if (s == "-ngl" || s == "--n-gpu-layers"){ const char * v = next("-ngl"); if (!v) return false; a.ngl = atoi(v); }
         else if (s == "-c" || s == "--ctx-size")      { const char * v = next("-c"); if (!v) return false; a.ctx = atoi(v); }
+        else if (s == "--vram-headroom")              { const char * v = next("--vram-headroom"); if (!v) return false;
+                                                        std::string m = v;
+                                                        if      (m == "aggressive") a.vram_aggressive = true;
+                                                        else if (m == "safe")       a.vram_aggressive = false;
+                                                        else { fprintf(stderr, "--vram-headroom expects safe|aggressive\n"); return false; } }
         else if (s == "-a" || s == "--alias")         { const char * v = next("-a"); if (!v) return false; a.alias = v; }
         else if (s == "-fa" || s == "--flash-attn")   { a.fa = true; }
         else if (s == "--raw")                        { a.raw = true; }
@@ -273,7 +279,9 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, args)) {
         fprintf(stderr,
                 "usage: %s -m <model.gguf> [--host H] [--port P] [-ngl N] [-c CTX] [--flash-attn] [-a ALIAS]\n"
-                "          [--raw] [--show-reasoning]\n"
+                "          [--vram-headroom safe|aggressive] [--raw] [--show-reasoning]\n"
+                "  --vram-headroom   GPU headroom pad for the ctx auto-sizer: safe (default, max(13.5%% VRAM, 4 GB))\n"
+                "                    or aggressive (max(10%% VRAM, 3 GB)) - advertises a larger ctx at a thinner margin\n"
                 "  --raw             keep the model's <|channel> reasoning markers in the response content\n"
                 "  --show-reasoning  return the reasoning as an OpenAI reasoning_content field (default: drop)\n",
                 argv[0]);
@@ -384,11 +392,20 @@ int main(int argc, char ** argv) {
     // the dominant runtime allocation (the activation buffer is chunked), so size context against it: require
     // the store for an N-token prompt to fit in the GPU free space measured after the context is created.
     const size_t pkv_per_tok  = llama_diffusion_pkv_bytes_per_token(model, args.fa);
-    // Headroom beyond weights + store(N) for allocations the probe can't see at init: the F32 concat working
-    // set (prefix cast + Kfull/Vfull at sequence length) and the self-conditioning buffers (sc_embT ~n_vocab x
-    // n_embd F16, sc_dev ~n_vocab x canvas F32) - empirically ~3.5 GB near the ceiling. Generous so the
-    // advertised ctx survives a full-length prompt rather than OOMing on it.
-    const size_t vram_headroom = std::max(v_total ? (size_t) (v_total * 0.15) : 0, (size_t) 4096 * 1024 * 1024);
+    // Headroom beyond weights + store(N) for allocations the probe can't see at init: the concat working set
+    // (Kfull/Vfull at sequence length - now F16 under FA, half the former F32 size) and the self-conditioning
+    // buffers (sc_embT ~n_vocab x n_embd F16, sc_dev ~n_vocab x canvas F32). Measured ~1 GB near the ceiling; the
+    // safe default (0.135 / 4 GB floor) is deliberately generous so the advertised ctx survives a full-length
+    // prompt with a wide peak-free margin. --vram-headroom aggressive shifts BOTH knobs (0.10 / 3 GB floor),
+    // staying VRAM-proportional: it lets the auto-sizer advertise a larger ctx (the probe takes the largest cands
+    // step that still fits) at the cost of a thinner margin. The exact ctx is VRAM/model-dependent - confirm a
+    // full-length prompt fits before relying on it.
+    // aggressive (0.10 / 3 GB) was tuned so the probe lands one cands step up from safe (e.g. 40960 vs 32768 on a
+    // 32 GB card) while a full-length prompt there still keeps a real, positive peak-free margin (~1.3 GB
+    // measured). A smaller pad (e.g. 0.05) over-shoots to a ctx whose full-prompt margin is dangerously thin.
+    const double headroom_frac  = args.vram_aggressive ? 0.10 : 0.135;
+    const size_t headroom_floor = (args.vram_aggressive ? (size_t) 3072 : (size_t) 4096) * 1024 * 1024;
+    const size_t vram_headroom  = std::max(v_total ? (size_t) (v_total * headroom_frac) : 0, headroom_floor);
 
     auto probe = [&](int ceil_ctx, size_t budget, size_t gpu_headroom, int * out_n) -> llama_context * {
         for (int raw : cands) {
