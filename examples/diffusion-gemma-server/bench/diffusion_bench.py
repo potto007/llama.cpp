@@ -498,7 +498,7 @@ _CMP_TABLES = [
     ("Denoise ms/step - prompt axis (latency vs context)", "prompt_specs", "ms_per_step", "{:.1f}", True),
     ("Denoise ms/step - output axis (generation-bound)", "output_specs", "ms_per_step", "{:.1f}", True),
     ("Effective output tok/s - output axis", "output_specs", "eff_tok_s", "{:.1f}", False),
-    ("Prefill tok/s - prompt axis", "prompt_specs", "prefill_tok_s", "{:.0f}", True),
+    ("Prefill tok/s - prompt axis", "prompt_specs", "prefill_tok_s", "{:.0f}", False),  # throughput: higher better
 ]
 
 
