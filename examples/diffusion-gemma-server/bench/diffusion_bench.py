@@ -98,6 +98,7 @@ def chat(url, text, max_tokens, seed=42, timeout=1800):
         "wall_s": wall,
         "prefill_ms": tm.get("prefill_ms", 0.0),
         "denoise_ms": tm.get("denoise_ms", 0.0),
+        "total_ms": tm.get("total_ms", 0.0),
         "ms_per_step": tm.get("ms_per_step", 0.0),
         "n_steps": tm.get("n_steps", 0),
         "n_blocks": tm.get("n_blocks", 0),
@@ -212,8 +213,18 @@ def run_spec(url, spec, ratio, reps, warmup):
     last = runs[-1]
     ms_med, ms_std = median_std([r["ms_per_step"] for r in runs])
     pf_med, _ = median_std([r["prefill_ms"] for r in runs])
+    dn_med, _ = median_std([r["denoise_ms"] for r in runs])
+    tot_med, _ = median_std([r["total_ms"] for r in runs])
     prompt_tok = int(statistics.median([r["prompt_tok"] for r in runs]))
     compl_tok = int(statistics.median([r["compl_tok"] for r in runs]))
+    n_steps = int(statistics.median([r["n_steps"] for r in runs]))
+    n_blocks = int(statistics.median([r["n_blocks"] for r in runs]))
+
+    # derived metrics
+    eff_tok_s = compl_tok / (tot_med / 1000) if tot_med > 0 else 0.0   # effective output tok/s (end-to-end)
+    tok_per_step = compl_tok / n_steps if n_steps > 0 else 0.0          # diffusion efficiency
+    fill = compl_tok / (n_blocks * 256) if n_blocks > 0 else 0.0        # committed / canvas
+    prefill_tok_s = prompt_tok / (pf_med / 1000) if pf_med > 0 else 0.0
 
     measured = prompt_tok if spec["axis"] == "prompt" else compl_tok
     correct, why = check_correct(spec, last["content"])
@@ -221,8 +232,11 @@ def run_spec(url, spec, ratio, reps, warmup):
         "name": spec["name"], "axis": spec["axis"], "bucket": target,
         "prompt_tok": prompt_tok, "compl_tok": compl_tok,
         "size_ok": in_band(measured, target), "correct": correct, "why": why,
-        "ms_per_step": ms_med, "ms_std": ms_std, "prefill_ms": pf_med,
-        "n_steps": last["n_steps"], "n_blocks": last["n_blocks"],
+        "ms_per_step": ms_med, "ms_std": ms_std,
+        "prefill_ms": pf_med, "denoise_ms": dn_med, "total_ms": tot_med,
+        "n_steps": n_steps, "n_blocks": n_blocks,
+        "eff_tok_s": eff_tok_s, "tok_per_step": tok_per_step, "fill": fill,
+        "prefill_tok_s": prefill_tok_s,
     }
 
 
@@ -279,6 +293,19 @@ def main():
         print(f"{r['name']:<12}{r['axis']:<8}{r['bucket']:>8}{r['prompt_tok']:>12}{r['compl_tok']:>11}"
               f"{r['ms_per_step']:>8.1f}±{r['ms_std']:<2.0f}{'OK' if r['size_ok'] else 'MISS':>5}"
               f"{'OK' if r['correct'] else 'FAIL':>9}")
+
+    # ---- performance metrics table
+    print("\n" + "=" * 94)
+    print("PERFORMANCE METRICS")
+    print(f"{'spec':<12}{'prompt':>8}{'compl':>7}{'steps':>6}{'fill':>6}"
+          f"{'ms/step':>9}{'tok/step':>9}{'prefill t/s':>12}{'eff tok/s':>10}")
+    print("-" * 94)
+    for r in results:
+        if "error" in r:
+            continue
+        print(f"{r['name']:<12}{r['prompt_tok']:>8}{r['compl_tok']:>7}{r['n_steps']:>6}"
+              f"{r['fill']:>6.2f}{r['ms_per_step']:>9.1f}{r['tok_per_step']:>9.1f}"
+              f"{r['prefill_tok_s']:>12.0f}{r['eff_tok_s']:>10.1f}")
 
     def covered(axis, mx):
         need = [b for b in BUCKETS if b <= mx]
