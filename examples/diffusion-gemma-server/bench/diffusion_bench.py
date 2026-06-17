@@ -418,7 +418,7 @@ RENDERERS = {"text": render_text, "json": render_json, "html": render_html, "md"
 EXT = {"text": ".txt", "json": ".json", "html": ".html", "md": ".md"}
 
 
-def write_outputs(report, formats, out):
+def write_outputs(report, formats, out, renderers=RENDERERS):
     """Render `report` in each format. With --out: single format -> that path, multiple -> stem+ext.
     Without --out: print each format to stdout."""
     import os.path as _p
@@ -427,7 +427,7 @@ def write_outputs(report, formats, out):
         root, ext = _p.splitext(out)
         stem = root if ext.lower() in (".txt", ".json", ".html", ".md") else out
     for fmt in formats:
-        body = RENDERERS[fmt](report)
+        body = renderers[fmt](report)
         if not out:
             if len(formats) > 1:
                 print(f"\n===== {fmt} =====")
@@ -437,6 +437,170 @@ def write_outputs(report, formats, out):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(body if body.endswith("\n") else body + "\n")
             print(f"wrote {fmt} -> {path}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- comparison mode
+# Render a side-by-side comparison of several saved JSON reports (one column per config). The harness
+# measures per-step latency / throughput; it does NOT measure VRAM or the auto-sized context ceiling, so
+# those are out of scope here (annotate them separately if needed).
+def parse_compare_entry(s):
+    """`label=path` or just `path` (label derived from the filename, stripping a leading report_)."""
+    if "=" in s and not os.path.exists(s):
+        label, path = s.split("=", 1)
+        return label.strip(), path.strip()
+    base = os.path.basename(s)
+    for pre in ("report_", "report-"):
+        if base.startswith(pre):
+            base = base[len(pre):]
+    return os.path.splitext(base)[0], s
+
+
+def build_comparison(entries, title="DiffusionGemma benchmark comparison", notes=None):
+    configs, data, seen = [], {}, {}
+    for ent in entries:
+        label, path = parse_compare_entry(ent)
+        with open(path, encoding="utf-8") as f:
+            results = json.load(f).get("results", [])
+        by_name = {}
+        for r in results:
+            if "error" in r or "ms_per_step" not in r:
+                continue
+            by_name[r["name"]] = r
+            size = r["prompt_tok"] if r["axis"] == "prompt" else r["compl_tok"]
+            seen.setdefault(r["name"], {"name": r["name"], "bucket": r["bucket"], "axis": r["axis"], "size": size})
+        configs.append(label)
+        data[label] = by_name
+    prompt_specs = sorted([v for v in seen.values() if v["axis"] == "prompt"], key=lambda x: x["bucket"])
+    output_specs = sorted([v for v in seen.values() if v["axis"] == "output"], key=lambda x: x["bucket"])
+    return {"title": title, "configs": configs, "data": data,
+            "prompt_specs": prompt_specs, "output_specs": output_specs, "notes": notes or []}
+
+
+def _ccell(comp, label, spec_name, metric, fmt):
+    r = comp["data"][label].get(spec_name)
+    if not r or r.get(metric) is None:
+        return "-"
+    return fmt.format(r[metric])
+
+
+def _row_label(sp):
+    # prompt size is ~identical across configs (deterministic prompts); committed output is not, so label
+    # output rows by their bucket target instead of one config's measured length.
+    return f"{sp['size']:,}" if sp["axis"] == "prompt" else f"{sp['bucket'] // 1000}k"
+
+
+def _col0(specs_key):
+    return "prompt tok" if "prompt" in specs_key else "out bkt"
+
+
+# each table: (heading, spec-list-key, metric, value-format, lower_is_better)
+_CMP_TABLES = [
+    ("Denoise ms/step - prompt axis (latency vs context)", "prompt_specs", "ms_per_step", "{:.1f}", True),
+    ("Denoise ms/step - output axis (generation-bound)", "output_specs", "ms_per_step", "{:.1f}", True),
+    ("Effective output tok/s - output axis", "output_specs", "eff_tok_s", "{:.1f}", False),
+    ("Prefill tok/s - prompt axis", "prompt_specs", "prefill_tok_s", "{:.0f}", True),
+]
+
+
+def render_compare_json(comp):
+    return json.dumps(comp, indent=2)
+
+
+def render_compare_text(comp):
+    out = [comp["title"], f"configs: {', '.join(comp['configs'])}", ""]
+    w = max(12, *(len(c) for c in comp["configs"]))
+    for heading, specs_key, metric, fmt, _ in _CMP_TABLES:
+        specs = comp[specs_key]
+        if not specs:
+            continue
+        out.append(heading)
+        out.append(f"{_col0(specs_key):>9}" + "".join(f"{c:>{w + 2}}" for c in comp["configs"]))
+        for sp in specs:
+            row = f"{_row_label(sp):>9}" + "".join(
+                f"{_ccell(comp, c, sp['name'], metric, fmt):>{w + 2}}" for c in comp["configs"])
+            out.append(row)
+        out.append("")
+    if comp.get("notes"):
+        out += ["Notes:"] + [f"  - {n}" for n in comp["notes"]] + [""]
+    return "\n".join(out)
+
+
+def render_compare_md(comp):
+    out = [f"# {comp['title']}", "", f"Configs: {', '.join('`' + c + '`' for c in comp['configs'])}", ""]
+    for heading, specs_key, metric, fmt, _ in _CMP_TABLES:
+        specs = comp[specs_key]
+        if not specs:
+            continue
+        out += [f"## {heading}", "", f"| {_col0(specs_key)} | " + " | ".join(comp["configs"]) + " |",
+                "|---:|" + "|".join(["---:"] * len(comp["configs"])) + "|"]
+        for sp in specs:
+            cells = " | ".join(_ccell(comp, c, sp["name"], metric, fmt) for c in comp["configs"])
+            out.append(f"| {_row_label(sp)} | {cells} |")
+        out.append("")
+    if comp.get("notes"):
+        out += ["## Notes", ""] + [f"- {n}" for n in comp["notes"]] + [""]
+    return "\n".join(out)
+
+
+def render_compare_html(comp):
+    def best_idx(sp, metric, lower):
+        vals = []
+        for c in comp["configs"]:
+            r = comp["data"][c].get(sp["name"])
+            vals.append(r[metric] if r and r.get(metric) is not None else None)
+        present = [(i, v) for i, v in enumerate(vals) if v is not None]
+        if not present:
+            return -1
+        return (min if lower else max)(present, key=lambda t: t[1])[0]
+
+    sections = []
+    for heading, specs_key, metric, fmt, lower in _CMP_TABLES:
+        specs = comp[specs_key]
+        if not specs:
+            continue
+        head = "".join(f"<th>{_h(c)}</th>" for c in comp["configs"])
+        rows = []
+        for sp in specs:
+            bi = best_idx(sp, metric, lower)
+            cells = []
+            for i, c in enumerate(comp["configs"]):
+                val = _ccell(comp, c, sp["name"], metric, fmt)
+                cells.append(f'<td class="{"best" if i == bi and val != "-" else ""}">{val}</td>')
+            rows.append(f'<tr><td>{_row_label(sp)}</td>{"".join(cells)}</tr>')
+        sections.append(f'<h2>{_h(heading)}</h2><table><thead><tr><th>{_col0(specs_key)}</th>{head}</tr></thead>'
+                        f'<tbody>{"".join(rows)}</tbody></table>')
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_h(comp['title'])}</title>
+<style>
+  :root {{ --fg:#1a1a1a; --mut:#666; --line:#e2e2e2; --best:#2a6; --hl:#f6f8fa; }}
+  body {{ font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         color:var(--fg); max-width:920px; margin:2.5rem auto; padding:0 1.2rem; }}
+  h1 {{ font-size:1.5rem; margin:0 0 .2rem; }}
+  h2 {{ font-size:1.1rem; margin:1.8rem 0 .5rem; border-bottom:2px solid var(--line); padding-bottom:.3rem; }}
+  .sub {{ color:var(--mut); margin:0 0 1rem; font-size:.9rem; }}
+  table {{ border-collapse:collapse; width:100%; margin:.3rem 0 1rem; font-variant-numeric:tabular-nums; }}
+  th,td {{ padding:.35rem .6rem; text-align:right; border-bottom:1px solid var(--line); }}
+  th:first-child, td:first-child {{ text-align:left; }}
+  thead th {{ border-bottom:2px solid #ccc; }}
+  tbody tr:hover {{ background:var(--hl); }}
+  .best {{ color:var(--best); font-weight:600; }}
+  .note {{ color:var(--mut); font-size:.85rem; }}
+</style></head><body>
+<h1>{_h(comp['title'])}</h1>
+<p class="sub">Configs: {' &middot; '.join('<b>' + _h(c) + '</b>' for c in comp['configs'])}.
+Lower ms/step and higher tok/s are better (best in each row highlighted).</p>
+{''.join(sections)}
+{('<h2>Notes</h2><ul>' + ''.join('<li>' + _h(n) + '</li>' for n in comp['notes']) + '</ul>') if comp.get('notes') else ''}
+<p class="note">Generated by diffusion_bench.py --compare. Latency and throughput are measured by the harness;
+any VRAM or context-ceiling figures appear under Notes and are supplied manually.</p>
+</body></html>
+"""
+
+
+COMPARE_RENDERERS = {"text": render_compare_text, "json": render_compare_json,
+                     "html": render_compare_html, "md": render_compare_md}
 
 
 def main():
@@ -452,6 +616,12 @@ def main():
                     help="output path; single format -> this file, multiple -> used as a stem (ext appended); "
                          "omit to print to stdout")
     ap.add_argument("--json", default="", help="(compat) write JSON to this path; adds json to --format")
+    ap.add_argument("--compare", nargs="+", default=None, metavar="LABEL=REPORT.json",
+                    help="render a side-by-side comparison of saved JSON reports (no server run); each entry "
+                         "is `label=path` or just `path`")
+    ap.add_argument("--title", default="DiffusionGemma benchmark comparison", help="title for --compare output")
+    ap.add_argument("--note", action="append", default=None, metavar="TEXT",
+                    help="add an annotation line to --compare output (repeatable; e.g. VRAM/ceiling facts)")
     args = ap.parse_args()
 
     formats = [f.strip() for f in args.format.split(",") if f.strip()]
@@ -463,6 +633,12 @@ def main():
     bad = [f for f in formats if f not in RENDERERS]
     if bad:
         ap.error(f"unknown format(s): {bad}; choose from {list(RENDERERS)}")
+
+    # --compare: render saved reports side by side, no server run.
+    if args.compare:
+        comp = build_comparison(args.compare, title=args.title, notes=args.note)
+        write_outputs(comp, formats, out, renderers=COMPARE_RENDERERS)
+        sys.exit(0)
 
     print(f"calibrating tokenizer ratio against {args.url} ...", file=sys.stderr, flush=True)
     ratio = measure_ratio(args.url)

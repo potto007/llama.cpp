@@ -1,107 +1,27 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DiffusionGemma KV-store benchmark</title>
+<title>DiffusionGemma prompt-KV store: benchmark comparison</title>
 <style>
-  :root { --fg:#1a1a1a; --mut:#666; --line:#e2e2e2; --accent:#2a6; --bad:#c33; --hl:#f6f8fa; }
-  * { box-sizing:border-box; }
-  body { font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  :root { --fg:#1a1a1a; --mut:#666; --line:#e2e2e2; --best:#2a6; --hl:#f6f8fa; }
+  body { font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
          color:var(--fg); max-width:920px; margin:2.5rem auto; padding:0 1.2rem; }
-  h1 { font-size:1.7rem; margin:0 0 .2rem; }
-  h2 { font-size:1.2rem; margin:2rem 0 .6rem; border-bottom:2px solid var(--line); padding-bottom:.3rem; }
-  .sub { color:var(--mut); margin:0 0 1.4rem; }
-  table { border-collapse:collapse; width:100%; margin:.4rem 0 1rem; font-variant-numeric:tabular-nums; }
-  th,td { padding:.4rem .6rem; text-align:right; border-bottom:1px solid var(--line); }
+  h1 { font-size:1.5rem; margin:0 0 .2rem; }
+  h2 { font-size:1.1rem; margin:1.8rem 0 .5rem; border-bottom:2px solid var(--line); padding-bottom:.3rem; }
+  .sub { color:var(--mut); margin:0 0 1rem; font-size:.9rem; }
+  table { border-collapse:collapse; width:100%; margin:.3rem 0 1rem; font-variant-numeric:tabular-nums; }
+  th,td { padding:.35rem .6rem; text-align:right; border-bottom:1px solid var(--line); }
   th:first-child, td:first-child { text-align:left; }
   thead th { border-bottom:2px solid #ccc; }
   tbody tr:hover { background:var(--hl); }
-  .best { color:var(--accent); font-weight:600; }
-  .bad { color:var(--bad); }
-  code { background:var(--hl); padding:.05rem .3rem; border-radius:3px; font-size:.9em; }
-  .note { color:var(--mut); font-size:.9rem; }
-  caption { caption-side:top; text-align:left; color:var(--mut); font-size:.9rem; padding-bottom:.3rem; }
-</style>
-</head>
-<body>
-<h1>DiffusionGemma prompt-KV store: benchmark</h1>
-<p class="sub">RTX 5090 &middot; DiffusionGemma 26B-A4B Q4_K_M &middot; flash-attn &middot; ctx 32768 &middot; seed 42.
-Reproduce with <code>examples/diffusion-gemma-server/bench/diffusion_bench.py</code>.</p>
-
-<p>Four configurations across the optimization arc:</p>
-<ul>
-  <li><b>Baseline</b> - pre-pad-fix (<code>DG_FATTN_KV_PAD=1</code>, &asymp; commit <code>1ed05a6b7</code>): the
-      6 head-dim-512 global layers fall back to <b>CPU flash-attn</b>.</li>
-  <li><b>F16</b> - pad-fixed F16 store (current default): global FA back on the GPU.</li>
-  <li><b>Q8 no-cache</b> - SWA-layer Q8_0 store, dequantized to F32 on every denoise step.</li>
-  <li><b>Q8+cache</b> - SWA-Q8 store + per-block dequant cache (shipped, <code>DG_KV_STORE=q8</code>).</li>
-</ul>
-
-<h2>1. Denoise ms/step - prompt axis (latency vs context)</h2>
-<table>
-  <caption>Short output; isolates per-step attention cost. Lower is better.</caption>
-  <thead><tr><th>prompt tok</th><th>Baseline (CPU)</th><th>F16</th><th>Q8 no-cache</th><th>Q8+cache</th></tr></thead>
-  <tbody>
-    <tr><td>1,309</td><td class="bad">292.5</td><td>58.3</td><td>109.1</td><td>65.3</td></tr>
-    <tr><td>2,768</td><td class="bad">500.2</td><td>54.3</td><td>110.1</td><td>66.3</td></tr>
-    <tr><td>5,568</td><td class="bad">909.9</td><td>59.4</td><td>113.7</td><td>69.0</td></tr>
-    <tr><td>10,897</td><td class="bad">1,742.2</td><td>58.2</td><td>112.7</td><td>68.4</td></tr>
-    <tr><td>20,785</td><td>-</td><td>61.0</td><td>115.1</td><td>70.8</td></tr>
-    <tr><td><b>vs context</b></td><td class="bad">O(P), ~6&times;</td><td class="best">flat 1.13&times;</td><td>flat 1.06&times;</td><td class="best">flat 1.08&times;</td></tr>
-    <tr><td><b>vs F16</b></td><td class="bad">~30&times;</td><td>1.0&times;</td><td>~1.9&times;</td><td class="best">~1.15&times;</td></tr>
-  </tbody>
-</table>
-<p class="note">The baseline scales ~linearly with context (the CPU-FA fallback re-runs the whole prompt every step).
-The pad fix made it flat on the GPU. Q8+cache stays flat at ~1.15&times; F16.</p>
-
-<h2>2. Denoise ms/step &amp; effective output tok/s - output axis (generation-bound)</h2>
-<table>
-  <caption>Small prompt, long output. ms/step lower is better; eff tok/s higher is better.</caption>
-  <thead><tr><th>output tok</th><th>F16 ms/step</th><th>Q8 no-cache</th><th>Q8+cache</th>
-    <th>F16 eff t/s</th><th>Q8 no-cache</th><th>Q8+cache</th></tr></thead>
-  <tbody>
-    <tr><td>1,536</td><td>56.1</td><td>108.6</td><td>61.7</td><td>183.2</td><td>102.1</td><td>169.0</td></tr>
-    <tr><td>3,072</td><td>56.6</td><td>109.3</td><td>62.2</td><td>160.7</td><td>97.8</td><td>156.7</td></tr>
-    <tr><td>~6,000</td><td>57.7</td><td>110.7</td><td>63.0</td><td>130.8</td><td>82.0</td><td>122.1</td></tr>
-    <tr><td>~9,000</td><td>59.7</td><td>112.2</td><td>65.0</td><td>93.0</td><td>58.5</td><td>78.5</td></tr>
-  </tbody>
-</table>
-<p class="note">SWA-Q8 without the cache costs a flat ~1.9&times; F16 (the capped-window dequant every step);
-the per-block cache recovers ~85% of that, landing at ~1.15&times;.</p>
-
-<h2>3. Prefill throughput (tok/s)</h2>
-<table>
-  <thead><tr><th>prompt tok</th><th>Baseline (CPU)</th><th>F16</th><th>Q8 no-cache</th><th>Q8+cache</th></tr></thead>
-  <tbody>
-    <tr><td>1,309</td><td class="bad">2,068</td><td>29,634</td><td>29,824</td><td>29,824</td></tr>
-    <tr><td>5,568</td><td class="bad">1,252</td><td>15,467</td><td>12,654</td><td>12,614</td></tr>
-    <tr><td>10,897</td><td class="bad">2,099</td><td>12,457</td><td>9,811</td><td>9,787</td></tr>
-  </tbody>
-</table>
-
-<h2>4. Diffusion efficiency (config-independent)</h2>
-<p>Tokens/step &asymp; 8-14 and fill ratio &asymp; 1.0 (canvas full) or ~0.44 (short answers) across all configs -
-these are model/schedule properties. The KV-store work changed <em>step cost</em>, not diffusion efficiency.</p>
-
-<h2>Bottom line</h2>
-<table>
-  <thead><tr><th></th><th>Baseline</th><th>F16</th><th>Q8 no-cache</th><th>Q8+cache</th></tr></thead>
-  <tbody>
-    <tr><td>ms/step @ ~11k</td><td class="bad">1,742</td><td>58</td><td>113</td><td class="best">68</td></tr>
-    <tr><td>latency vs context</td><td class="bad">O(P)</td><td>flat</td><td>flat</td><td class="best">flat</td></tr>
-    <tr><td>context ceiling (auto)</td><td>32k</td><td>32k</td><td>65k</td><td class="best">65k</td></tr>
-    <tr><td>VRAM @30k vs F16</td><td>-</td><td>0</td><td>&minus;2.8 GB</td><td class="best">&minus;2.3 GB</td></tr>
-    <tr><td>denoise vs F16</td><td class="bad">~30&times;</td><td>1.0&times;</td><td>1.9&times;</td><td class="best">1.15&times;</td></tr>
-  </tbody>
-</table>
-<p>The arc: the pad-256 fix took denoise from <b>O(P) CPU-bound</b> to <b>flat GPU</b>; SWA-Q8 + a per-block
-dequant cache then <b>doubled the context ceiling (32k&rarr;65k)</b> for a <b>~15% denoise cost</b> and
-<b>~2.3&nbsp;GB</b> saved.</p>
-
-<p class="note">Method: the baseline column is <code>DG_FATTN_KV_PAD=1</code> on the current build (isolates the pad
-variable; the actual <code>1ed05a6b7</code> binary crashed on the 2nd request under the current server). Its 16k /
-output rows are omitted because CPU-bound runs are prohibitively slow. Q8-no-cache was measured with a temporary
-<code>DG_NO_DEC_CACHE</code> toggle (not in the shipped build).</p>
-</body>
-</html>
+  .best { color:var(--best); font-weight:600; }
+  .note { color:var(--mut); font-size:.85rem; }
+</style></head><body>
+<h1>DiffusionGemma prompt-KV store: benchmark comparison</h1>
+<p class="sub">Configs: <b>Baseline</b> &middot; <b>F16</b> &middot; <b>Q8 no-cache</b> &middot; <b>Q8+cache</b>.
+Lower ms/step and higher tok/s are better (best in each row highlighted).</p>
+<h2>Denoise ms/step - prompt axis (latency vs context)</h2><table><thead><tr><th>prompt tok</th><th>Baseline</th><th>F16</th><th>Q8 no-cache</th><th>Q8+cache</th></tr></thead><tbody><tr><td>1,309</td><td class="">292.5</td><td class="best">58.3</td><td class="">109.1</td><td class="">65.3</td></tr><tr><td>2,768</td><td class="">500.2</td><td class="best">54.3</td><td class="">110.1</td><td class="">66.3</td></tr><tr><td>5,568</td><td class="">909.9</td><td class="best">59.4</td><td class="">113.7</td><td class="">69.0</td></tr><tr><td>10,897</td><td class="">1742.2</td><td class="best">58.2</td><td class="">112.7</td><td class="">68.4</td></tr><tr><td>20,785</td><td class="">-</td><td class="best">61.0</td><td class="">115.1</td><td class="">70.8</td></tr></tbody></table><h2>Denoise ms/step - output axis (generation-bound)</h2><table><thead><tr><th>out bkt</th><th>Baseline</th><th>F16</th><th>Q8 no-cache</th><th>Q8+cache</th></tr></thead><tbody><tr><td>1k</td><td class="">-</td><td class="best">56.1</td><td class="">108.6</td><td class="">61.7</td></tr><tr><td>2k</td><td class="">-</td><td class="best">56.6</td><td class="">109.3</td><td class="">62.2</td></tr><tr><td>4k</td><td class="">-</td><td class="best">57.7</td><td class="">110.7</td><td class="">63.0</td></tr><tr><td>8k</td><td class="">-</td><td class="best">59.7</td><td class="">112.2</td><td class="">65.0</td></tr></tbody></table><h2>Effective output tok/s - output axis</h2><table><thead><tr><th>out bkt</th><th>Baseline</th><th>F16</th><th>Q8 no-cache</th><th>Q8+cache</th></tr></thead><tbody><tr><td>1k</td><td class="">-</td><td class="best">183.2</td><td class="">102.1</td><td class="">169.0</td></tr><tr><td>2k</td><td class="">-</td><td class="best">160.7</td><td class="">97.8</td><td class="">156.7</td></tr><tr><td>4k</td><td class="">-</td><td class="best">130.8</td><td class="">82.0</td><td class="">122.1</td></tr><tr><td>8k</td><td class="">-</td><td class="best">93.0</td><td class="">58.5</td><td class="">78.5</td></tr></tbody></table><h2>Prefill tok/s - prompt axis</h2><table><thead><tr><th>prompt tok</th><th>Baseline</th><th>F16</th><th>Q8 no-cache</th><th>Q8+cache</th></tr></thead><tbody><tr><td>1,309</td><td class="best">2068</td><td class="">29634</td><td class="">29784</td><td class="">29824</td></tr><tr><td>2,768</td><td class="best">2217</td><td class="">16304</td><td class="">14166</td><td class="">13978</td></tr><tr><td>5,568</td><td class="best">1252</td><td class="">15467</td><td class="">12654</td><td class="">12614</td></tr><tr><td>10,897</td><td class="best">2099</td><td class="">12457</td><td class="">9811</td><td class="">9787</td></tr><tr><td>20,785</td><td class="">-</td><td class="">10454</td><td class="best">8407</td><td class="">8430</td></tr></tbody></table>
+<h2>Notes</h2><ul><li>Hardware: RTX 5090 (32 GB), DiffusionGemma 26B-A4B Q4_K_M, flash-attn, seed 42.</li><li>Baseline = DG_FATTN_KV_PAD=1 (CPU-bound global FA); F16 = pad-fixed default; Q8 = SWA-only Q8_0 store; Q8+cache = with per-block dequant cache (shipped).</li><li>Context ceiling (auto-sized): F16 32768 -&gt; Q8 65536 (doubled).</li><li>VRAM saved @30k prompt vs F16: Q8 no-cache -2.8 GB, Q8+cache -2.3 GB (cache ~0.5 GB).</li><li>Baseline output-axis and 16k rows omitted: CPU-bound runs are prohibitively slow.</li></ul>
+<p class="note">Generated by diffusion_bench.py --compare. Latency and throughput are measured by the harness;
+any VRAM or context-ceiling figures appear under Notes and are supplied manually.</p>
+</body></html>

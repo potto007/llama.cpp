@@ -82,5 +82,25 @@ with `--format` (comma-separated: `text`, `json`, `html`, `md`; default `text`) 
 
 `--json PATH` is kept as a backward-compatible alias for `--format json --out PATH`.
 
-To A/B two KV-store configs, run the same command against each server build and diff the
-`ms/step` column.
+### Comparing configurations
+
+To A/B several KV-store configs, save one JSON report per config (run the same command against each
+server build), then render them side by side with `--compare`. Each entry is `label=path`:
+
+```bash
+# one report per config
+... --format json --out data/f16.json        # against the F16 server
+DG_KV_STORE=q8 ... --format json --out data/q8-cache.json   # against the Q8 server
+# ... etc
+
+# render the comparison (no server run); --note adds facts the harness cannot measure
+python3 diffusion_bench.py --compare \
+  "Baseline=data/baseline.json" "F16=data/f16.json" \
+  "Q8 no-cache=data/q8-nocache.json" "Q8+cache=data/q8-cache.json" \
+  --note "Context ceiling: F16 32768 -> Q8 65536" \
+  --format html,md --out RESULTS
+```
+
+`--compare` emits four tables (denoise ms/step by prompt size and by output size, effective output
+tok/s, prefill tok/s), highlighting the best config per row. `RESULTS.html` / `RESULTS.md` in this
+directory are generated this way from the saved reports in `data/`.
