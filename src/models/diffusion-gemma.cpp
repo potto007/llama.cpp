@@ -20,6 +20,35 @@
 // prompt-KV as a view padded up to this, with the pad rows masked to -inf. Must match ggml-cuda FATTN_KQ_STRIDE.
 static constexpr int64_t DG_FATTN_KV_PAD = 256;
 
+// Base prompt-KV store dtype. Non-FA path stays F32 (exact, unpadded). Under FA the store is F16 (precision-
+// neutral: build_attn casts K,V to F16 anyway) unless DG_KV_STORE=q8, which requests Q8_0. Q8 is the base for
+// SWA layers only (see dg_layer_store_type) - it shrinks the dominant per-token VRAM to raise the context
+// ceiling. Q8 is LOSSY, so it is opt-in via env and never the default. Concat/FA still run in F16/F32 (the Q8
+// prefix view is dequantized to F32 before the concat; CUDA flash-attn consumes F32 K,V directly). See
+// to_concat() and the concat sites below.
+static ggml_type dg_store_type(bool flash_attn) {
+    if (!flash_attn) {
+        return GGML_TYPE_F32;
+    }
+    const char * e = getenv("DG_KV_STORE");
+    if (e && strcmp(e, "q8") == 0) {
+        return GGML_TYPE_Q8_0;
+    }
+    return GGML_TYPE_F16;
+}
+
+// Per-layer store dtype. The Q8 quantization applies to SWA layers ONLY: in DECODE they read a capped
+// O(n_swa-1) window per denoise step, so the Q8->F32 dequant-on-read is bounded. The 6 global layers (head dim
+// 512) read the whole O(P) prefix every denoise step - quantizing them would re-introduce prompt-scaled denoise
+// latency (the pathology the 256-pad fix removed), so they stay at the base FA dtype (F16). SWA layers are ~89%
+// of the store, so this keeps almost all of the VRAM win with no latency regression.
+static ggml_type dg_layer_store_type(ggml_type base, const llama_hparams & hparams, int il) {
+    if (base == GGML_TYPE_Q8_0 && !hparams.is_swa(il)) {
+        return GGML_TYPE_F16;
+    }
+    return base;
+}
+
 // Region-aware additive mask for the unified [prompt | canvas] forward. Prompt queries are causal
 // (SWA-clipped in sliding layers); canvas queries are bidirectional. Canvas->prompt reach: global
 // layers see all prompt, sliding layers only the last (n_swa-1) prompt positions.
@@ -409,7 +438,7 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
     // Allocate the store on the first PREFILL chunk, sized to the whole prompt (pkv_P). Type follows FA so it
     // is precision-neutral: under FA, build_attn casts K,V to F16 regardless. DECODE only reads a prior store.
     if (is_prefill && dmodel.pkv_P > 0) {
-        dg_ensure_pkv_store(dmodel, dmodel.pkv_P, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        dg_ensure_pkv_store(dmodel, dmodel.pkv_P, dg_store_type(cparams.flash_attn));
     }
 
     // guard the prompt-KV store is allocated and large enough (misuse fails loudly, not OOB)
@@ -547,19 +576,20 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         ggml_tensor * Kcur = kv.k;
         ggml_tensor * Vcur = kv.v;
 
-        // The store is F16 under FA (halves the persistent K,V store; FA casts K,V to F16 anyway, so it is
-        // precision-neutral) and F32 otherwise. The concat runs in the STORE dtype: the prefix view is already
-        // store-typed, and the fresh F32 K,V are cast down to it. Under FA this makes Kfull/Vfull F16 - half the
-        // transient concat working set, no large prefix cast, and FA consumes the F16 result directly (it would
-        // otherwise re-cast F32->F16 internally). to_store() is a no-op when the store is F32 (non-FA path
-        // unchanged, bit-identical). F32->F16 of the fresh tail matches FA's own rounding, so output is
-        // bit-identical to the prior F32-concat path.
-        // Reads the store type lazily: pkv_k is only populated inside the is_prefill/is_decode paths (the store
-        // is allocated on the first prefill), so to_store() must not touch it from the unified/reserve path. It
-        // is only ever called below within those guards, where the store is valid.
-        const auto to_store = [&](ggml_tensor * t) {
+        // Bring a concat operand to the CONCAT dtype, which the CUDA concat kernel supports (F16/F32). For an
+        // F16/F32 store the concat dtype IS the store dtype, so the prefix views are no-ops and the fresh F32 tail
+        // is cast down (under FA: F16, half the transient working set, bit-identical to the prior F32-concat since
+        // F32->F16 matches FA's own rounding). For a Q8_0 store there is no quant concat kernel, so the concat
+        // runs in F32: the Q8 prefix views dequantize to F32 (Q8_0->F32 cpy) and the fresh F32 tail passes through;
+        // FA then consumes the F32 K,V directly (it treats F32 K,V as the F16 path). The persistent store stays
+        // Q8 (the VRAM win); only the transient per-layer concat operands are dequantized.
+        // Reads the store type lazily: pkv_k is only populated inside the is_prefill/is_decode paths (the store is
+        // allocated on the first prefill), so to_concat() must not touch it from the unified/reserve path. It is
+        // only ever called below within those guards, where the store is valid.
+        const auto to_concat = [&](ggml_tensor * t) {
             const ggml_type st = dmodel.pkv_k[il]->type;
-            return t->type == st ? t : ggml_cast(ctx0, t, st);
+            const ggml_type ct = ggml_is_quantized(st) ? GGML_TYPE_F32 : st; // quant store -> dequant to F32
+            return t->type == ct ? t : ggml_cast(ctx0, t, ct);
         };
 
         if (is_prefill) {
@@ -571,7 +601,7 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
                                             dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], koff);
             ggml_tensor * sv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, n_tokens,
                                             dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], voff);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, sk));   // F32 -> store type (F16/F32)
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, sk));   // F32 -> store type (F16/F32/Q8_0)
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, sv));
             // Attend causally over the prefix + this chunk's fresh K,V. Global layers prepend the full prefix
             // [0, prefill_off); SWA layers only the sliding window [prefill_off-swa_prefix, prefill_off) - every
@@ -588,8 +618,8 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
                                                 dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], pkoff);
                 ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, pfx_len,
                                                 dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], pvoff);
-                Kfull = ggml_concat(ctx0, pk, to_store(Kcur), 2);
-                Vfull = ggml_concat(ctx0, pv, to_store(Vcur), 2);
+                Kfull = ggml_concat(ctx0, to_concat(pk), to_concat(Kcur), 2);
+                Vfull = ggml_concat(ctx0, to_concat(pv), to_concat(Vcur), 2);
             }
             // Global layers (head dim 512): pad n_kv up to 256 so CUDA flash-attn serves this chunk (else CPU
             // fallback - the dominant prefill cost on the unaligned final chunk). Pad rows come from the zeroed
@@ -597,9 +627,9 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
             const int64_t n_kv   = prefill_off + n_tokens;
             const int64_t padded = cparams.flash_attn && !layer_swa ? GGML_PAD(n_kv, DG_FATTN_KV_PAD) : n_kv;
             if (padded > n_kv) {
-                if (pfx_len == 0) {  // Kfull is still the raw F32 Kcur; match the store-typed pad views
-                    Kfull = to_store(Kcur);
-                    Vfull = to_store(Vcur);
+                if (pfx_len == 0) {  // Kfull is still the raw F32 Kcur; match the concat-typed pad views
+                    Kfull = to_concat(Kcur);
+                    Vfull = to_concat(Vcur);
                 }
                 const size_t padk = (size_t) n_kv * dmodel.pkv_k[il]->nb[2];
                 const size_t padv = (size_t) n_kv * dmodel.pkv_v[il]->nb[2];
@@ -607,8 +637,8 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
                                                  dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], padk);
                 ggml_tensor * pdv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, padded - n_kv,
                                                  dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], padv);
-                Kfull = ggml_concat(ctx0, Kfull, pdk, 2);
-                Vfull = ggml_concat(ctx0, Vfull, pdv, 2);
+                Kfull = ggml_concat(ctx0, Kfull, to_concat(pdk), 2);
+                Vfull = ggml_concat(ctx0, Vfull, to_concat(pdv), 2);
             }
             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
                              Qcur, Kfull, Vfull, nullptr, nullptr, nullptr,
@@ -629,8 +659,8 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
                                             dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], pkoff);
             ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, dec_prefix,
                                             dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], pvoff);
-            ggml_tensor * Kfull = ggml_concat(ctx0, pk, to_store(Kcur), 2);
-            ggml_tensor * Vfull = ggml_concat(ctx0, pv, to_store(Vcur), 2);
+            ggml_tensor * Kfull = ggml_concat(ctx0, to_concat(pk), to_concat(Kcur), 2);
+            ggml_tensor * Vfull = ggml_concat(ctx0, to_concat(pv), to_concat(Vcur), 2);
             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
                              Qcur, Kfull, Vfull, nullptr, nullptr, nullptr,
                              hparams.f_attention_scale, il);
@@ -861,7 +891,8 @@ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C) {
 // map). Reallocates when the capacity grows or the type changes. Called from the graph (PREFILL), where the
 // type can follow cparams.flash_attn - F16 halves the store and is precision-neutral under FA.
 static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type) {
-    if (m.pkv_buf != nullptr && m.pkv_cap >= P && !m.pkv_k.empty() && m.pkv_k[0]->type == type) {
+    if (m.pkv_buf != nullptr && m.pkv_cap >= P && !m.pkv_k.empty() &&
+        m.pkv_k[0]->type == dg_layer_store_type(type, m.hparams, 0)) {
         return;
     }
     if (m.pkv_buf) { ggml_backend_buffer_free(m.pkv_buf); m.pkv_buf = nullptr; }
@@ -886,10 +917,11 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
     m.pkv_k.resize(n_layer);
     m.pkv_v.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
-        const int64_t hd  = m.hparams.n_embd_head_k(il);
-        const int64_t nkv = m.hparams.n_head_kv(il);
-        m.pkv_k[il] = ggml_new_tensor_3d(m.pkv_ctx, type, hd, nkv, cap);
-        m.pkv_v[il] = ggml_new_tensor_3d(m.pkv_ctx, type, hd, nkv, cap);
+        const int64_t   hd  = m.hparams.n_embd_head_k(il);
+        const int64_t   nkv = m.hparams.n_head_kv(il);
+        const ggml_type lt  = dg_layer_store_type(type, m.hparams, il); // SWA->base (maybe Q8), global->F16
+        m.pkv_k[il] = ggml_new_tensor_3d(m.pkv_ctx, lt, hd, nkv, cap);
+        m.pkv_v[il] = ggml_new_tensor_3d(m.pkv_ctx, lt, hd, nkv, cap);
         ggml_format_name(m.pkv_k[il], "pkv_k_l%d", il);
         ggml_format_name(m.pkv_v[il], "pkv_v_l%d", il);
     }
@@ -911,10 +943,13 @@ size_t llama_diffusion_pkv_bytes_per_token(const struct llama_model * model, boo
     if (!dm) {
         return 0;
     }
-    const size_t elt = use_f16 ? sizeof(ggml_fp16_t) : sizeof(float);
+    // Reflect the actual store dtype (F16/F32, or Q8_0 under DG_KV_STORE=q8) so the auto-sizer raises ctx when
+    // the store is quantized. use_f16 == "FA on"; row_size accounts for Q8_0's per-32-block scale overhead.
+    const ggml_type base = dg_store_type(use_f16);
     size_t bytes = 0;
     for (int il = 0; il < (int) dm->hparams.n_layer(); ++il) {
-        bytes += (size_t) dm->hparams.n_embd_head_k(il) * dm->hparams.n_head_kv(il) * 2 * elt; // K + V
+        const ggml_type lt = dg_layer_store_type(base, dm->hparams, il); // global stays F16 even under q8
+        bytes += (size_t) ggml_row_size(lt, dm->hparams.n_embd_head_k(il)) * dm->hparams.n_head_kv(il) * 2; // K+V
     }
     return bytes;
 }
