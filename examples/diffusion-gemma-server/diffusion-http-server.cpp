@@ -99,6 +99,13 @@ struct gen_result {
     std::string text;
     int         prompt_n     = 0;
     int         completion_n = 0;
+    // per-request timing (exposed in the response so benchmarks read it directly, not from stderr)
+    double      prefill_ms   = 0.0;
+    double      denoise_ms   = 0.0;
+    double      total_ms     = 0.0;
+    int         n_steps      = 0;
+    int         n_prefill_chunks = 0;
+    int         n_blocks_run = 0;
 };
 
 // Run the block-diffusion loop for one chat request. on_progress (optional) is called with the full raw
@@ -182,6 +189,12 @@ static gen_result run_generation(server_state & st, const std::string & prompt, 
     const double denoise_ms = agg.denoise_us / 1e3;
     const double ms_step    = agg.n_steps > 0 ? denoise_ms / agg.n_steps : 0.0;
     const int    canvas_n   = blocks_run * (int) st.canvas_length;  // raw canvas tokens resolved (pre-trim)
+    r.prefill_ms = prefill_ms;
+    r.denoise_ms = denoise_ms;
+    r.total_ms   = total_ms;
+    r.n_steps    = agg.n_steps;
+    r.n_prefill_chunks = agg.n_prefill_chunks;
+    r.n_blocks_run     = blocks_run;
     // Throughputs, each measuring a distinct thing:
     //   prefill = prompt tokens / prefill time            (input processing)
     //   denoise = committed output tokens / denoise time  (effective generation rate)
@@ -644,6 +657,13 @@ int main(int argc, char ** argv) {
                 { "usage", { { "prompt_tokens", r.prompt_n },
                              { "completion_tokens", r.completion_n },
                              { "total_tokens", r.prompt_n + r.completion_n } } },
+                { "timings", { { "prefill_ms", r.prefill_ms },
+                               { "denoise_ms", r.denoise_ms },
+                               { "total_ms", r.total_ms },
+                               { "n_steps", r.n_steps },
+                               { "ms_per_step", r.n_steps > 0 ? r.denoise_ms / r.n_steps : 0.0 },
+                               { "n_prefill_chunks", r.n_prefill_chunks },
+                               { "n_blocks", r.n_blocks_run } } },
             };
             res.set_content(resp.dump(), "application/json");
             return;
