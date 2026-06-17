@@ -870,6 +870,18 @@ struct llama_model_diffusion_gemma : public llama_model_base {
     mutable ggml_context        * pkv_ctx = nullptr;
     mutable ggml_backend_buffer_t pkv_buf = nullptr;
 
+    // Dequantized SWA decode-window cache (only used when the store is Q8). Each SWA layer's DECODE prefix
+    // window [P-w, P) is step-invariant within a request, so it is dequantized Q8->F32 ONCE (first denoise
+    // step) into this persistent buffer and reused across all later steps - removing the per-step dequant
+    // that is the dominant Q8 denoise cost. Invalidated (valid=false) on each new PREFILL. Global layers
+    // (F16 store, no dequant) never use it; their slots stay null.
+    mutable bool        pkv_dec_cache_valid = false;
+    mutable int64_t     pkv_dec_cap = 0;   // window capacity (>= n_swa-1) of the cache
+    mutable std::vector<ggml_tensor *> pkv_dec_k;  // per SWA layer [hd, nkv, pkv_dec_cap] F32; null for global
+    mutable std::vector<ggml_tensor *> pkv_dec_v;
+    mutable ggml_context        * pkv_dec_ctx = nullptr;
+    mutable ggml_backend_buffer_t pkv_dec_buf = nullptr;
+
     ~llama_model_diffusion_gemma() override;
 
     struct graph : public llm_graph_context {

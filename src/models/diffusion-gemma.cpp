@@ -395,6 +395,8 @@ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C);
 // fwd decl: lazily (re)allocate the device-resident prompt-KV store (per-layer K,V, grow-only) at the given
 // element type. Allocated from the graph so the type can follow cparams.flash_attn (F16 under FA).
 static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type);
+// fwd decl: lazily allocate the F32 dequant cache for SWA decode windows (used only when the store is Q8).
+static void dg_ensure_pkv_dec_cache(const llama_model_diffusion_gemma & m);
 
 std::unique_ptr<llm_graph_context> llama_model_diffusion_gemma::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
@@ -446,6 +448,14 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         const int64_t need = is_prefill ? (prefill_off + n_tokens) : P;
         GGML_ASSERT(!dmodel.pkv_k.empty() && !dmodel.pkv_v.empty() && dmodel.pkv_cap >= need &&
                     "DiffusionGemma prompt-KV store not allocated/sized for this phase");
+    }
+
+    // When the store is quantized, DECODE dequantizes each SWA layer's step-invariant prompt window once
+    // into a persistent F32 cache and reuses it across denoise steps (pkv_k[0] is a SWA layer).
+    const bool dec_cache_active = is_decode && !dmodel.pkv_k.empty() &&
+                                  ggml_is_quantized(dmodel.pkv_k[0]->type);
+    if (dec_cache_active) {
+        dg_ensure_pkv_dec_cache(dmodel);
     }
 
     // Canvas input embedding = rms_norm_noscale(embed*sqrt(n_embd) [+ self-conditioning]). Shared by
@@ -659,8 +669,27 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
                                             dmodel.pkv_k[il]->nb[1], dmodel.pkv_k[il]->nb[2], pkoff);
             ggml_tensor * pv = ggml_view_3d(ctx0, dmodel.pkv_v[il], n_embd_head, n_head_kv, dec_prefix,
                                             dmodel.pkv_v[il]->nb[1], dmodel.pkv_v[il]->nb[2], pvoff);
-            ggml_tensor * Kfull = ggml_concat(ctx0, to_concat(pk), to_concat(Kcur), 2);
-            ggml_tensor * Vfull = ggml_concat(ctx0, to_concat(pv), to_concat(Vcur), 2);
+            // SWA layers under a Q8 store: read the dequantized window from the persistent F32 cache instead of
+            // re-dequantizing the Q8 view every step. Populate it once (when invalid); thereafter it is a plain
+            // F32 input. Global layers (and non-quant stores) keep the direct to_concat() path.
+            ggml_tensor * pfx_k, * pfx_v;
+            if (dec_cache_active && hparams.is_swa(il)) {
+                ggml_tensor * ck = ggml_view_3d(ctx0, dmodel.pkv_dec_k[il], n_embd_head, n_head_kv, dec_prefix,
+                                                dmodel.pkv_dec_k[il]->nb[1], dmodel.pkv_dec_k[il]->nb[2], 0);
+                ggml_tensor * cv = ggml_view_3d(ctx0, dmodel.pkv_dec_v[il], n_embd_head, n_head_kv, dec_prefix,
+                                                dmodel.pkv_dec_v[il]->nb[1], dmodel.pkv_dec_v[il]->nb[2], 0);
+                if (!dmodel.pkv_dec_cache_valid) {
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, pk, ck));  // Q8 -> F32, once per request
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, pv, cv));
+                }
+                pfx_k = ck;  // already F32
+                pfx_v = cv;
+            } else {
+                pfx_k = to_concat(pk);
+                pfx_v = to_concat(pv);
+            }
+            ggml_tensor * Kfull = ggml_concat(ctx0, pfx_k, to_concat(Kcur), 2);
+            ggml_tensor * Vfull = ggml_concat(ctx0, pfx_v, to_concat(Vcur), 2);
             cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
                              Qcur, Kfull, Vfull, nullptr, nullptr, nullptr,
                              hparams.f_attention_scale, il);
@@ -701,6 +730,11 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
         cb(cur, "l_out", il);
 
         inpL = cur;
+    }
+
+    // The dequant cache is now populated by this build's cpy ops; later denoise steps reuse it (read-only).
+    if (dec_cache_active) {
+        dmodel.pkv_dec_cache_valid = true;
     }
 
     cur = inpL;
@@ -791,6 +825,8 @@ bool llama_diffusion_device_sample(const struct llama_model * model, const float
 llama_model_diffusion_gemma::~llama_model_diffusion_gemma() {
     if (pkv_buf) { ggml_backend_buffer_free(pkv_buf); pkv_buf = nullptr; }
     if (pkv_ctx) { ggml_free(pkv_ctx); pkv_ctx = nullptr; }
+    if (pkv_dec_buf) { ggml_backend_buffer_free(pkv_dec_buf); pkv_dec_buf = nullptr; }
+    if (pkv_dec_ctx) { ggml_free(pkv_dec_ctx); pkv_dec_ctx = nullptr; }
     if (sc_embT_buf) { ggml_backend_buffer_free(sc_embT_buf); sc_embT_buf = nullptr; }
     if (sc_embT_ctx) { ggml_free(sc_embT_ctx); sc_embT_ctx = nullptr; }
     if (sc_dev_buf)  { ggml_backend_buffer_free(sc_dev_buf);  sc_dev_buf  = nullptr; }
@@ -935,6 +971,50 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
     m.pkv_cap = cap;
 }
 
+// Lazily allocate the F32 dequant cache for SWA decode windows. One [hd, nkv, win] tensor per SWA layer (win =
+// max decode window = n_swa-1); global-layer slots stay null (they read the F16 store directly, no dequant).
+// Sized once - the window is capped by n_swa regardless of prompt length - so it never reallocates per request.
+static void dg_ensure_pkv_dec_cache(const llama_model_diffusion_gemma & m) {
+    const int64_t win = m.hparams.n_swa > 0 ? (int64_t) m.hparams.n_swa - 1 : m.pkv_cap;
+    if (m.pkv_dec_buf != nullptr && m.pkv_dec_cap >= win && !m.pkv_dec_k.empty()) {
+        return;
+    }
+    if (m.pkv_dec_buf) { ggml_backend_buffer_free(m.pkv_dec_buf); m.pkv_dec_buf = nullptr; }
+    if (m.pkv_dec_ctx) { ggml_free(m.pkv_dec_ctx); m.pkv_dec_ctx = nullptr; }
+    m.pkv_dec_k.clear();
+    m.pkv_dec_v.clear();
+
+    const int n_layer = (int) m.hparams.n_layer();
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) (2 * n_layer + 4),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    m.pkv_dec_ctx = ggml_init(ip);
+    GGML_ASSERT(m.pkv_dec_ctx != nullptr);
+    m.pkv_dec_k.resize(n_layer, nullptr);
+    m.pkv_dec_v.resize(n_layer, nullptr);
+    for (int il = 0; il < n_layer; ++il) {
+        if (!m.hparams.is_swa(il)) {
+            continue;  // global layers keep the F16 store; no dequant, no cache
+        }
+        const int64_t hd  = m.hparams.n_embd_head_k(il);
+        const int64_t nkv = m.hparams.n_head_kv(il);
+        m.pkv_dec_k[il] = ggml_new_tensor_3d(m.pkv_dec_ctx, GGML_TYPE_F32, hd, nkv, win);
+        m.pkv_dec_v[il] = ggml_new_tensor_3d(m.pkv_dec_ctx, GGML_TYPE_F32, hd, nkv, win);
+        ggml_format_name(m.pkv_dec_k[il], "pkv_dec_k_l%d", il);
+        ggml_format_name(m.pkv_dec_v[il], "pkv_dec_v_l%d", il);
+    }
+
+    ggml_backend_dev_t dev = m.dev_layer(0);
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev)
+                                          : ggml_backend_cpu_buffer_type();
+    m.pkv_dec_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.pkv_dec_ctx, buft);
+    GGML_ASSERT(m.pkv_dec_buf != nullptr);
+    m.pkv_dec_cap        = win;
+    m.pkv_dec_cache_valid = false;  // freshly (re)allocated: force repopulate
+}
+
 // Public API: bytes the prompt-KV store consumes per prompt token (sum over layers of K+V element counts x
 // element size). 0 for non-DiffusionGemma. Lets a caller size context against the store, the dominant runtime
 // allocation once the activation buffer is chunked. use_f16 must match the store type (FA on -> F16).
@@ -965,4 +1045,7 @@ void llama_diffusion_set_phase(struct llama_model * model, int phase, int32_t P,
     dm->pkv_phase       = (llama_model_diffusion_gemma::pkv_phase_t) phase;
     dm->pkv_P           = P;
     dm->pkv_prefill_off = off;   // PREFILL chunk start; ignored by UNIFIED/DECODE
+    if (phase == llama_model_diffusion_gemma::PKV_PREFILL) {
+        dm->pkv_dec_cache_valid = false;  // new request: the dequant cache must be repopulated on first DECODE
+    }
 }
