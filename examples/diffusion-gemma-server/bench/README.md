@@ -53,11 +53,34 @@ Run the benchmark:
 
 ```bash
 python3 examples/diffusion-gemma-server/bench/diffusion_bench.py \
-  --prompt-max 16000 --output-max 8000 --reps 3 --json report.json
+  --prompt-max 16000 --output-max 8000 --reps 3
 ```
 
 Flags: `--url` (default `http://127.0.0.1:8088/v1/chat/completions`), `--reps`, `--warmup`,
-`--prompt-max`, `--output-max`, `--json`.
+`--prompt-max`, `--output-max`.
+
+### Output modes
+
+Progress lines go to stderr; the report goes to stdout (or to files). Pick one or more formats
+with `--format` (comma-separated: `text`, `json`, `html`, `md`; default `text`) and an optional
+`--out` path:
+
+```bash
+# text report to stdout (default)
+... diffusion_bench.py
+
+# one format to an exact file
+... diffusion_bench.py --format html --out report.html
+
+# several formats at once: --out is used as a stem, extensions are appended
+# (writes report.txt, report.json, report.html, report.md)
+... diffusion_bench.py --format text,json,html,md --out report
+
+# no --out with multiple formats prints each to stdout, separated by markers
+... diffusion_bench.py --format md,json
+```
+
+`--json PATH` is kept as a backward-compatible alias for `--format json --out PATH`.
 
 To A/B two KV-store configs, run the same command against each server build and diff the
 `ms/step` column.

@@ -251,6 +251,194 @@ def make_specs(prompt_max, output_max):
     return specs
 
 
+# --------------------------------------------------------------------------- report assembly
+def build_coverage(results, prompt_max, output_max):
+    def covered(axis, mx):
+        need = [b for b in BUCKETS if b <= mx]
+        got = {r["bucket"] for r in results
+               if r.get("axis") == axis and r.get("size_ok") and r.get("correct")}
+        return [b for b in need if b not in got]
+    miss_prompt = covered("prompt", prompt_max)
+    miss_output = covered("output", output_max)
+    all_correct = all(r.get("correct") for r in results)
+    return {
+        "missing_prompt": miss_prompt, "missing_output": miss_output,
+        "all_correct": all_correct,
+        "pass": not miss_prompt and not miss_output and all_correct,
+    }
+
+
+def _cov_str(missing, mx):
+    return "COMPLETE" if not missing else "MISSING " + str([b // 1000 for b in missing]) + "k"
+
+
+# --------------------------------------------------------------------------- renderers
+def render_json(report):
+    return json.dumps(report, indent=2)
+
+
+def render_text(report):
+    m, results, cov = report["meta"], report["results"], report["coverage"]
+    out = []
+    out.append(f"DiffusionGemma benchmark  ({m['url']}, reps={m['reps']}, chars/tok~={m['ratio']:.2f})")
+    out.append("=" * 94)
+    out.append(f"{'spec':<12}{'axis':<8}{'bucket':>8}{'prompt_tok':>12}{'compl_tok':>11}"
+               f"{'ms/step':>11}{'size':>7}{'correct':>9}")
+    out.append("-" * 94)
+    for r in results:
+        if "error" in r:
+            out.append(f"{r['name']:<12}{r['axis']:<8}{r['bucket']:>8}   ERROR: {r['error']}")
+            continue
+        out.append(f"{r['name']:<12}{r['axis']:<8}{r['bucket']:>8}{r['prompt_tok']:>12}{r['compl_tok']:>11}"
+                   f"{r['ms_per_step']:>8.1f}±{r['ms_std']:<2.0f}{'OK' if r['size_ok'] else 'MISS':>5}"
+                   f"{'OK' if r['correct'] else 'FAIL':>9}")
+    out.append("\n" + "=" * 94)
+    out.append("PERFORMANCE METRICS")
+    out.append(f"{'spec':<12}{'prompt':>8}{'compl':>7}{'steps':>6}{'fill':>6}"
+               f"{'ms/step':>9}{'tok/step':>9}{'prefill t/s':>12}{'eff tok/s':>10}")
+    out.append("-" * 94)
+    for r in results:
+        if "error" in r:
+            continue
+        out.append(f"{r['name']:<12}{r['prompt_tok']:>8}{r['compl_tok']:>7}{r['n_steps']:>6}"
+                   f"{r['fill']:>6.2f}{r['ms_per_step']:>9.1f}{r['tok_per_step']:>9.1f}"
+                   f"{r['prefill_tok_s']:>12.0f}{r['eff_tok_s']:>10.1f}")
+    out.append("\n" + "=" * 94)
+    out.append(f"prompt-size coverage 1k..{m['prompt_max'] // 1000}k : {_cov_str(cov['missing_prompt'], m['prompt_max'])}")
+    out.append(f"output-size coverage 1k..{m['output_max'] // 1000}k : {_cov_str(cov['missing_output'], m['output_max'])}")
+    out.append(f"output correctness                : {'ALL PASS' if cov['all_correct'] else 'FAILURES'}")
+    out.append(f"\nSPEC RESULT: {'PASS' if cov['pass'] else 'FAIL'}")
+    return "\n".join(out) + "\n"
+
+
+def render_md(report):
+    m, results, cov = report["meta"], report["results"], report["coverage"]
+    out = ["# DiffusionGemma benchmark report", ""]
+    out.append(f"`{m['url']}` &middot; reps={m['reps']} &middot; chars/token ~= {m['ratio']:.2f}".replace("&middot;", "|"))
+    out += ["", "## Spec", "",
+            "| spec | axis | bucket | prompt_tok | compl_tok | ms/step | size | correct |",
+            "|---|---|---:|---:|---:|---:|:--:|:--:|"]
+    for r in results:
+        if "error" in r:
+            out.append(f"| {r['name']} | {r['axis']} | {r['bucket']} | | | | | ERROR: {r['error']} |")
+            continue
+        out.append(f"| {r['name']} | {r['axis']} | {r['bucket']} | {r['prompt_tok']} | {r['compl_tok']} | "
+                   f"{r['ms_per_step']:.1f}±{r['ms_std']:.0f} | {'OK' if r['size_ok'] else 'MISS'} | "
+                   f"{'OK' if r['correct'] else 'FAIL'} |")
+    out += ["", "## Performance metrics", "",
+            "| spec | prompt | compl | steps | fill | ms/step | tok/step | prefill t/s | eff tok/s |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for r in results:
+        if "error" in r:
+            continue
+        out.append(f"| {r['name']} | {r['prompt_tok']} | {r['compl_tok']} | {r['n_steps']} | {r['fill']:.2f} | "
+                   f"{r['ms_per_step']:.1f} | {r['tok_per_step']:.1f} | {r['prefill_tok_s']:.0f} | "
+                   f"{r['eff_tok_s']:.1f} |")
+    out += ["", "## Coverage", "",
+            f"- prompt-size 1k..{m['prompt_max'] // 1000}k: {_cov_str(cov['missing_prompt'], m['prompt_max'])}",
+            f"- output-size 1k..{m['output_max'] // 1000}k: {_cov_str(cov['missing_output'], m['output_max'])}",
+            f"- output correctness: {'ALL PASS' if cov['all_correct'] else 'FAILURES'}",
+            "", f"**SPEC RESULT: {'PASS' if cov['pass'] else 'FAIL'}**", ""]
+    return "\n".join(out)
+
+
+def _h(s):  # minimal HTML escape
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def render_html(report):
+    m, results, cov = report["meta"], report["results"], report["coverage"]
+    spec_rows = []
+    for r in results:
+        if "error" in r:
+            spec_rows.append(f'<tr><td>{_h(r["name"])}</td><td>{_h(r["axis"])}</td><td>{r["bucket"]}</td>'
+                             f'<td colspan="5" class="bad">ERROR: {_h(r["error"])}</td></tr>')
+            continue
+        sz = "OK" if r["size_ok"] else "MISS"
+        co = "OK" if r["correct"] else "FAIL"
+        spec_rows.append(
+            f'<tr><td>{_h(r["name"])}</td><td>{_h(r["axis"])}</td><td>{r["bucket"]}</td>'
+            f'<td>{r["prompt_tok"]}</td><td>{r["compl_tok"]}</td>'
+            f'<td>{r["ms_per_step"]:.1f}&plusmn;{r["ms_std"]:.0f}</td>'
+            f'<td class="{"" if r["size_ok"] else "bad"}">{sz}</td>'
+            f'<td class="{"" if r["correct"] else "bad"}">{co}</td></tr>')
+    perf_rows = []
+    for r in results:
+        if "error" in r:
+            continue
+        perf_rows.append(
+            f'<tr><td>{_h(r["name"])}</td><td>{r["prompt_tok"]}</td><td>{r["compl_tok"]}</td>'
+            f'<td>{r["n_steps"]}</td><td>{r["fill"]:.2f}</td><td>{r["ms_per_step"]:.1f}</td>'
+            f'<td>{r["tok_per_step"]:.1f}</td><td>{r["prefill_tok_s"]:.0f}</td>'
+            f'<td>{r["eff_tok_s"]:.1f}</td></tr>')
+    verdict = "PASS" if cov["pass"] else "FAIL"
+    vclass = "best" if cov["pass"] else "bad"
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiffusionGemma benchmark</title>
+<style>
+  :root {{ --fg:#1a1a1a; --mut:#666; --line:#e2e2e2; --best:#2a6; --bad:#c33; --hl:#f6f8fa; }}
+  body {{ font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         color:var(--fg); max-width:920px; margin:2.5rem auto; padding:0 1.2rem; }}
+  h1 {{ font-size:1.5rem; margin:0 0 .2rem; }}
+  h2 {{ font-size:1.1rem; margin:1.8rem 0 .5rem; border-bottom:2px solid var(--line); padding-bottom:.3rem; }}
+  .sub {{ color:var(--mut); margin:0 0 1rem; font-size:.9rem; }}
+  table {{ border-collapse:collapse; width:100%; margin:.3rem 0 1rem; font-variant-numeric:tabular-nums; }}
+  th,td {{ padding:.35rem .55rem; text-align:right; border-bottom:1px solid var(--line); }}
+  th:first-child, td:first-child {{ text-align:left; }}
+  thead th {{ border-bottom:2px solid #ccc; }}
+  tbody tr:hover {{ background:var(--hl); }}
+  .best {{ color:var(--best); font-weight:600; }}
+  .bad {{ color:var(--bad); font-weight:600; }}
+  .verdict {{ font-size:1.1rem; font-weight:700; margin-top:1rem; }}
+</style></head><body>
+<h1>DiffusionGemma benchmark</h1>
+<p class="sub">{_h(m['url'])} &middot; reps={m['reps']} &middot; chars/token ~= {m['ratio']:.2f}</p>
+<h2>Spec</h2>
+<table><thead><tr><th>spec</th><th>axis</th><th>bucket</th><th>prompt_tok</th><th>compl_tok</th>
+<th>ms/step</th><th>size</th><th>correct</th></tr></thead>
+<tbody>{''.join(spec_rows)}</tbody></table>
+<h2>Performance metrics</h2>
+<table><thead><tr><th>spec</th><th>prompt</th><th>compl</th><th>steps</th><th>fill</th>
+<th>ms/step</th><th>tok/step</th><th>prefill t/s</th><th>eff tok/s</th></tr></thead>
+<tbody>{''.join(perf_rows)}</tbody></table>
+<h2>Coverage</h2>
+<ul>
+<li>prompt-size 1k..{m['prompt_max'] // 1000}k: {_cov_str(cov['missing_prompt'], m['prompt_max'])}</li>
+<li>output-size 1k..{m['output_max'] // 1000}k: {_cov_str(cov['missing_output'], m['output_max'])}</li>
+<li>output correctness: {'ALL PASS' if cov['all_correct'] else 'FAILURES'}</li>
+</ul>
+<p class="verdict {vclass}">SPEC RESULT: {verdict}</p>
+</body></html>
+"""
+
+
+RENDERERS = {"text": render_text, "json": render_json, "html": render_html, "md": render_md}
+EXT = {"text": ".txt", "json": ".json", "html": ".html", "md": ".md"}
+
+
+def write_outputs(report, formats, out):
+    """Render `report` in each format. With --out: single format -> that path, multiple -> stem+ext.
+    Without --out: print each format to stdout."""
+    import os.path as _p
+    stem = out
+    if out and len(formats) > 1:
+        root, ext = _p.splitext(out)
+        stem = root if ext.lower() in (".txt", ".json", ".html", ".md") else out
+    for fmt in formats:
+        body = RENDERERS[fmt](report)
+        if not out:
+            if len(formats) > 1:
+                print(f"\n===== {fmt} =====")
+            print(body)
+        else:
+            path = out if len(formats) == 1 else stem + EXT[fmt]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body if body.endswith("\n") else body + "\n")
+            print(f"wrote {fmt} -> {path}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Diffusion-gemma server benchmark (spec-enforcing).")
     ap.add_argument("--url", default="http://127.0.0.1:8088/v1/chat/completions")
@@ -258,79 +446,56 @@ def main():
     ap.add_argument("--warmup", type=int, default=1, help="unmeasured warmup runs per spec")
     ap.add_argument("--prompt-max", type=int, default=16000, help="largest prompt bucket (<= server ctx)")
     ap.add_argument("--output-max", type=int, default=8000, help="largest output bucket (model-reachable)")
-    ap.add_argument("--json", default="", help="optional path to write the JSON report")
+    ap.add_argument("--format", default="text",
+                    help="comma-separated output formats: text,json,html,md (default text)")
+    ap.add_argument("--out", default="",
+                    help="output path; single format -> this file, multiple -> used as a stem (ext appended); "
+                         "omit to print to stdout")
+    ap.add_argument("--json", default="", help="(compat) write JSON to this path; adds json to --format")
     args = ap.parse_args()
 
-    print(f"calibrating tokenizer ratio against {args.url} ...", flush=True)
+    formats = [f.strip() for f in args.format.split(",") if f.strip()]
+    out = args.out
+    if args.json:  # back-compat: --json PATH behaves like --format json --out PATH
+        if "json" not in formats:
+            formats = ["json"] if formats == ["text"] else formats + ["json"]
+        out = out or args.json
+    bad = [f for f in formats if f not in RENDERERS]
+    if bad:
+        ap.error(f"unknown format(s): {bad}; choose from {list(RENDERERS)}")
+
+    print(f"calibrating tokenizer ratio against {args.url} ...", file=sys.stderr, flush=True)
     ratio = measure_ratio(args.url)
-    print(f"  chars/token ~= {ratio:.2f}\n", flush=True)
+    print(f"  chars/token ~= {ratio:.2f}\n", file=sys.stderr, flush=True)
 
     specs = make_specs(args.prompt_max, args.output_max)
     results = []
     for spec in specs:
-        print(f"running {spec['name']:<12} ...", end=" ", flush=True)
+        print(f"running {spec['name']:<12} ...", end=" ", file=sys.stderr, flush=True)
         try:
             res = run_spec(args.url, spec, ratio, args.reps, args.warmup)
         except Exception as e:  # noqa: BLE001
-            print(f"ERROR {e}")
+            print(f"ERROR {e}", file=sys.stderr)
             results.append({"name": spec["name"], "axis": spec["axis"], "bucket": spec["bucket"],
                             "error": str(e), "size_ok": False, "correct": False})
             continue
         print(f"prompt={res['prompt_tok']:>6} compl={res['compl_tok']:>6} "
               f"denoise={res['ms_per_step']:.1f}ms/step  "
               f"size={'OK' if res['size_ok'] else 'MISS'} corr={'OK' if res['correct'] else 'FAIL'}"
-              f"{'' if res['correct'] else '  (' + res.get('why', '') + ')'}")
+              f"{'' if res['correct'] else '  (' + res.get('why', '') + ')'}", file=sys.stderr)
         results.append(res)
 
-    print("\n" + "=" * 94)
-    print(f"{'spec':<12}{'axis':<8}{'bucket':>8}{'prompt_tok':>12}{'compl_tok':>11}"
-          f"{'ms/step':>11}{'size':>7}{'correct':>9}")
-    print("-" * 94)
-    for r in results:
-        if "error" in r:
-            print(f"{r['name']:<12}{r['axis']:<8}{r['bucket']:>8}   ERROR: {r['error']}")
-            continue
-        print(f"{r['name']:<12}{r['axis']:<8}{r['bucket']:>8}{r['prompt_tok']:>12}{r['compl_tok']:>11}"
-              f"{r['ms_per_step']:>8.1f}±{r['ms_std']:<2.0f}{'OK' if r['size_ok'] else 'MISS':>5}"
-              f"{'OK' if r['correct'] else 'FAIL':>9}")
-
-    # ---- performance metrics table
-    print("\n" + "=" * 94)
-    print("PERFORMANCE METRICS")
-    print(f"{'spec':<12}{'prompt':>8}{'compl':>7}{'steps':>6}{'fill':>6}"
-          f"{'ms/step':>9}{'tok/step':>9}{'prefill t/s':>12}{'eff tok/s':>10}")
-    print("-" * 94)
-    for r in results:
-        if "error" in r:
-            continue
-        print(f"{r['name']:<12}{r['prompt_tok']:>8}{r['compl_tok']:>7}{r['n_steps']:>6}"
-              f"{r['fill']:>6.2f}{r['ms_per_step']:>9.1f}{r['tok_per_step']:>9.1f}"
-              f"{r['prefill_tok_s']:>12.0f}{r['eff_tok_s']:>10.1f}")
-
-    def covered(axis, mx):
-        need = [b for b in BUCKETS if b <= mx]
-        got = {r["bucket"] for r in results
-               if r.get("axis") == axis and r.get("size_ok") and r.get("correct")}
-        return [b for b in need if b not in got]
-
-    miss_prompt = covered("prompt", args.prompt_max)
-    miss_output = covered("output", args.output_max)
-    all_correct = all(r.get("correct") for r in results)
-    print("\n" + "=" * 94)
-    print(f"prompt-size coverage 1k..{args.prompt_max // 1000}k : "
-          f"{'COMPLETE' if not miss_prompt else 'MISSING ' + str([b // 1000 for b in miss_prompt]) + 'k'}")
-    print(f"output-size coverage 1k..{args.output_max // 1000}k : "
-          f"{'COMPLETE' if not miss_output else 'MISSING ' + str([b // 1000 for b in miss_output]) + 'k'}")
-    print(f"output correctness                : {'ALL PASS' if all_correct else 'FAILURES'}")
-    ok = not miss_prompt and not miss_output and all_correct
-    print(f"\nSPEC RESULT: {'PASS' if ok else 'FAIL'}")
-
-    if args.json:
-        with open(args.json, "w") as f:
-            json.dump({"ratio": ratio, "results": results, "missing_prompt": miss_prompt,
-                       "missing_output": miss_output, "pass": ok}, f, indent=2)
-        print(f"wrote {args.json}")
-    sys.exit(0 if ok else 1)
+    cov = build_coverage(results, args.prompt_max, args.output_max)
+    report = {
+        "meta": {"url": args.url, "ratio": ratio, "reps": args.reps,
+                 "prompt_max": args.prompt_max, "output_max": args.output_max},
+        "results": results,
+        "coverage": cov,
+        # flat back-compat keys for older JSON consumers
+        "missing_prompt": cov["missing_prompt"], "missing_output": cov["missing_output"], "pass": cov["pass"],
+    }
+    write_outputs(report, formats, out)
+    sys.exit(0 if cov["pass"] else 1)
 
 
 if __name__ == "__main__":
