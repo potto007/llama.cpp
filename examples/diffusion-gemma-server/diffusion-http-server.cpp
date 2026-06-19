@@ -188,6 +188,15 @@ static gen_result run_generation(server_state & st, const std::string & prompt, 
     r.prompt_n     = P;
     r.completion_n = (int) response.size();
 
+    // Opt-in (DG_LOG_REQUESTS): dump the RAW committed output WITH special tokens so an intermittent
+    // "narration but no tool call" turn can be diagnosed after the fact - shows whether the model emitted
+    // a <|tool_call>...<tool_call|>, a thought-only <|channel>...<channel|>, or nothing actionable.
+    if (getenv("DG_LOG_REQUESTS") != nullptr) {
+        fprintf(stderr, "=== DG_LOG_REQUESTS: raw model output (%d tok, with markers) ===\n%s\n"
+                        "=== end raw output ===\n", (int) response.size(),
+                common_detokenize(st.vocab, response, /*special*/ true).c_str());
+    }
+
     // per-request perf summary: PREFILL (prompt -> KV store) and DENOISE (canvas steps) are timed separately
     // because end-to-end latency is dominated by the adaptive step count, not the output length.
     const double total_ms   = (ggml_time_us() - t_req_start) / 1e3;
