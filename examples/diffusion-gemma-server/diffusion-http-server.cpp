@@ -553,11 +553,18 @@ int main(int argc, char ** argv) {
 
     st.output_tokens.resize(st.maxtok);
 
+    // Resolve the prompt-KV store label for the log (mirrors dg_store_type): non-FA is F32; under FA it is F16
+    // unless DG_KV_STORE selects a quantized SWA store. Makes "is q4/q8 actually active?" visible at a glance.
+    const char * kv_env   = getenv("DG_KV_STORE");
+    const char * kv_store = !args.fa ? "f32"
+                          : (kv_env && !strcmp(kv_env, "q8")) ? "q8"
+                          : (kv_env && !strcmp(kv_env, "q4")) ? "q4" : "f16";
     fprintf(stderr,
             "llama-diffusion-server: model=%s n_vocab=%d canvas=%d ctx=%d (%s) ngl=%d fa=%s "
-            "gpu_sampling=%s kv_cache=%s\n",
+            "gpu_sampling=%s kv_cache=%s kv_store=%s (%.0f KiB/tok)\n",
             st.model_id.c_str(), n_vocab, (int) st.canvas_length, st.maxtok, reason, args.ngl,
-            args.fa ? "on" : "off", st.base.gpu_sampling ? "on" : "off", st.base.kv_cache ? "on" : "off");
+            args.fa ? "on" : "off", st.base.gpu_sampling ? "on" : "off", st.base.kv_cache ? "on" : "off",
+            kv_store, (double) pkv_per_tok / 1024.0);
 
     // ------------------------------------------------------------------------- HTTP
     httplib::Server svr;
