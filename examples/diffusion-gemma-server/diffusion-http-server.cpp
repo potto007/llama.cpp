@@ -602,6 +602,13 @@ int main(int argc, char ** argv) {
                             "application/json");
             return;
         }
+        // Opt-in diagnostics: DG_LOG_REQUESTS=1 dumps the raw incoming request body so a misbehaving client's
+        // exact payload (system prompt, tool schema, prior-turn formatting) can be inspected and replayed.
+        const bool dbg_req = getenv("DG_LOG_REQUESTS") != nullptr;
+        if (dbg_req) {
+            fprintf(stderr, "\n=== DG_LOG_REQUESTS: request body ===\n%s\n=== end request body ===\n",
+                    req.body.c_str());
+        }
 
         const json & messages = body.at("messages");
         const int  seed   = body.value("seed", 0);
@@ -638,6 +645,10 @@ int main(int argc, char ** argv) {
             inputs.parallel_tool_calls = body.value("parallel_tool_calls", false);
             cp     = common_chat_templates_apply(st.chat_templates.get(), inputs);
             prompt = cp.prompt;
+            if (dbg_req) {
+                fprintf(stderr, "=== DG_LOG_REQUESTS: templated prompt (%zu chars) ===\n%s\n"
+                                "=== end templated prompt ===\n", prompt.size(), prompt.c_str());
+            }
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(error_json(std::string("failed to apply chat template: ") + e.what(),
