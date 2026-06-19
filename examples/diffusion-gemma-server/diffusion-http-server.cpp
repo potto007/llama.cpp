@@ -123,6 +123,12 @@ static gen_result run_generation(server_state & st, const std::string & prompt, 
     }
 
     const int P = (int) prefix.size();
+    // n_blocks <= 0 means "no explicit output cap": fill the remaining context. The per-block max_length guard
+    // below stops exactly at the context limit (and the loop still early-breaks on eog/repetition), so a long
+    // reasoning + tool-call turn is no longer truncated to one canvas for clients that send no max_tokens.
+    const int block_cap = n_blocks > 0
+                              ? n_blocks
+                              : std::max(1, (int) ((st.maxtok - P) / (int) st.canvas_length));
     std::vector<llama_token> response;  // cumulative committed canvas tokens across blocks
 
     // per-request instrumentation, summed across blocks
@@ -130,7 +136,7 @@ static gen_result run_generation(server_state & st, const std::string & prompt, 
     int           blocks_run  = 0;   // blocks actually denoised (full canvas each)
     const int64_t t_req_start = ggml_time_us();
 
-    for (int b = 0; b < std::max(1, n_blocks); b++) {
+    for (int b = 0; b < block_cap; b++) {
         const int32_t prefix_len = (int32_t) prefix.size();
         const int32_t max_length = prefix_len + (int32_t) st.canvas_length;
         if (max_length > st.maxtok) {
@@ -209,7 +215,7 @@ static gen_result run_generation(server_state & st, const std::string & prompt, 
     LOG_INF("request: prompt=%d compl=%d canvas=%d blocks=%d | prefill %.0f ms (%d chunks) | "
             "denoise %.0f ms (%d steps, %.1f ms/step) | total %.0f ms | "
             "tok/s prefill=%.0f denoise=%.1f canvas=%.0f output=%.1f overall=%.0f\n",
-            P, r.completion_n, canvas_n, std::max(1, n_blocks), prefill_ms, agg.n_prefill_chunks,
+            P, r.completion_n, canvas_n, block_cap, prefill_ms, agg.n_prefill_chunks,
             denoise_ms, agg.n_steps, ms_step, total_ms,
             pp_tps, denoise_tps, canvas_tps, output_tps, overall_tps);
     return r;
@@ -601,13 +607,15 @@ int main(int argc, char ** argv) {
         const int  seed   = body.value("seed", 0);
         const bool stream = body.value("stream", false);
 
-        // n_blocks: explicit field wins; else derive from max_tokens; else 1.
+        // n_blocks: explicit field wins; else derive from max_tokens; else 0 = "fill remaining context"
+        // (run_generation expands 0 to (ctx-prompt)/canvas). A 1-block default truncated long reasoning/
+        // tool-call turns for clients (e.g. Cline) that send no max_tokens.
         int n_blocks = body.value("n_blocks", 0);
         if (n_blocks <= 0) {
             const int max_tokens = body.value("max_tokens", 0);
             n_blocks = max_tokens > 0
                            ? std::max(1, (int) ((max_tokens + st.canvas_length - 1) / st.canvas_length))
-                           : 1;
+                           : 0;
         }
 
         // Apply the chat template WITH the request's tools so the prompt advertises them, and capture the PEG
