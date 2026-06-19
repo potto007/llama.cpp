@@ -435,8 +435,12 @@ int main(int argc, char ** argv) {
     const int n_ctx_train = (int) llama_model_n_ctx_train(model);
     const int n_head      = std::max(1, (int) llama_model_n_head(model));
     const int floor_ctx   = std::max((int) st.canvas_length * 4, 2048);
-    const int auto_ceil   = n_ctx_train > 0 ? std::min(n_ctx_train, 65536) : 65536;
-    const int cands[]     = {65536, 49152, 40960, 32768, 24576, 20480, 16384, 12288, 8192, 6144, 4096, 2048};
+    // Cap at 131072: a quantized SWA store (DG_KV_STORE=q4 ~76 KiB/tok, q8 ~126) reaches well past the old 65536
+    // ceiling on a large card (q4 ~116k tok on 32 GB), so the ladder must extend above 65536 for the probe to land
+    // on it. The probe is VRAM-gated per candidate, so this never over-advertises - F16/q8/tight cards still stop
+    // at the largest candidate that actually fits.
+    const int auto_ceil   = n_ctx_train > 0 ? std::min(n_ctx_train, 131072) : 131072;
+    const int cands[]     = {131072, 114688, 98304, 81920, 65536, 49152, 40960, 32768, 24576, 20480, 16384, 12288, 8192, 6144, 4096, 2048};
 
     size_t v_free = 0, v_total = 0;
     if (gpu_dev) ggml_backend_dev_memory(gpu_dev, &v_free, &v_total);
@@ -491,14 +495,21 @@ int main(int argc, char ** argv) {
 
     llama_context * ctx = nullptr;
     const char * reason = "auto";
-    if (args.ctx > 0) {  // explicit budget: honour exactly if it fits (store included), else degrade via probe
+    if (args.ctx > 0) {  // explicit budget is authoritative: honour it as long as the context allocates.
         const double sc     = (double) n_head * (double) args.ctx * (double) args.ctx * 4.0;
         const size_t budget = std::max(v_free, ram_budget);
-        if (args.fa || !budget || sc <= (double) budget * 0.9) {  // FA off: gate on the fp32 scores estimate
+        if (args.fa || !budget || sc <= (double) budget * 0.9) {  // FA off: the fp32 scores buffer is a hard
+                                                                  // init-time alloc, so gate on whether it can fit
             ctx = llama_init_from_model(model, make_cparams(args.ctx));
-            if (ctx && gpu_dev) {  // ensure the prompt-KV store for args.ctx tokens also fits
+            if (ctx && gpu_dev) {  // warn (do NOT downgrade) if a full-length prompt-KV store may not fit: the
+                                   // store grows lazily to the actual prompt length, so a manual ctx the user
+                                   // never fills is fine. Honouring -c is the point; only flag the OOM risk.
                 size_t f = 0, t = 0; ggml_backend_dev_memory(gpu_dev, &f, &t);
-                if (f < pkv_per_tok * (size_t) args.ctx + vram_headroom) { llama_free(ctx); ctx = nullptr; }
+                const size_t need = pkv_per_tok * (size_t) args.ctx + vram_headroom;
+                if (f < need)
+                    fprintf(stderr, "warning: ctx=%d honoured but a full-length prompt may OOM - prompt-KV store"
+                            " + headroom needs ~%zu MiB, only %zu MiB GPU free after init\n",
+                            args.ctx, need / (1024 * 1024), f / (1024 * 1024));
             }
             if (ctx) { st.maxtok = args.ctx; reason = "requested"; }
         }

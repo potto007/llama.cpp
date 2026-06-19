@@ -21,29 +21,31 @@
 static constexpr int64_t DG_FATTN_KV_PAD = 256;
 
 // Base prompt-KV store dtype. Non-FA path stays F32 (exact, unpadded). Under FA the store is F16 (precision-
-// neutral: build_attn casts K,V to F16 anyway) unless DG_KV_STORE=q8, which requests Q8_0. Q8 is the base for
-// SWA layers only (see dg_layer_store_type) - it shrinks the dominant per-token VRAM to raise the context
-// ceiling. Q8 is LOSSY, so it is opt-in via env and never the default. Concat/FA still run in F16/F32 (the Q8
-// prefix view is dequantized to F32 before the concat; CUDA flash-attn consumes F32 K,V directly). See
-// to_concat() and the concat sites below.
+// neutral: build_attn casts K,V to F16 anyway) unless DG_KV_STORE requests a quantized store: q8 -> Q8_0,
+// q4 -> Q4_0. The quantized base applies to SWA layers only (see dg_layer_store_type) - it shrinks the dominant
+// per-token VRAM to raise the context ceiling. q4 ~halves the SWA store vs q8 (more ctx) at a larger precision
+// cost. Quantized stores are LOSSY, so they are opt-in via env and never the default. Concat/FA still run in
+// F16/F32 (the quant prefix view is dequantized to F32 before the concat; CUDA flash-attn consumes F32 K,V
+// directly). See to_concat() and the concat sites below.
 static ggml_type dg_store_type(bool flash_attn) {
     if (!flash_attn) {
         return GGML_TYPE_F32;
     }
     const char * e = getenv("DG_KV_STORE");
-    if (e && strcmp(e, "q8") == 0) {
-        return GGML_TYPE_Q8_0;
+    if (e) {
+        if (strcmp(e, "q8") == 0) { return GGML_TYPE_Q8_0; }
+        if (strcmp(e, "q4") == 0) { return GGML_TYPE_Q4_0; }
     }
     return GGML_TYPE_F16;
 }
 
-// Per-layer store dtype. The Q8 quantization applies to SWA layers ONLY: in DECODE they read a capped
-// O(n_swa-1) window per denoise step, so the Q8->F32 dequant-on-read is bounded. The 6 global layers (head dim
-// 512) read the whole O(P) prefix every denoise step - quantizing them would re-introduce prompt-scaled denoise
-// latency (the pathology the 256-pad fix removed), so they stay at the base FA dtype (F16). SWA layers are ~89%
-// of the store, so this keeps almost all of the VRAM win with no latency regression.
+// Per-layer store dtype. The quantization applies to SWA layers ONLY: in DECODE they read a capped O(n_swa-1)
+// window per denoise step, so the quant->F32 dequant-on-read is bounded. The 6 global layers (head dim 512) read
+// the whole O(P) prefix every denoise step - quantizing them would re-introduce prompt-scaled denoise latency
+// (the pathology the 256-pad fix removed), so they stay at the base FA dtype (F16). SWA layers are ~89% of the
+// store, so this keeps almost all of the VRAM win with no latency regression.
 static ggml_type dg_layer_store_type(ggml_type base, const llama_hparams & hparams, int il) {
-    if (base == GGML_TYPE_Q8_0 && !hparams.is_swa(il)) {
+    if (ggml_is_quantized(base) && !hparams.is_swa(il)) {
         return GGML_TYPE_F16;
     }
     return base;
