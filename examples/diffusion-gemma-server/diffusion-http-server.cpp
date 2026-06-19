@@ -643,6 +643,14 @@ int main(int argc, char ** argv) {
         try {
             common_chat_templates_inputs inputs;
             inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
+            // Gemma requires chain-of-thought to NOT be replayed into the prompt: feeding prior-turn reasoning
+            // back is off-distribution and makes the model emit a final narration + eog instead of a tool call
+            // (observed with clients like Cline that resend assistant `reasoning_content`). Strip it from all
+            // history messages before templating - the template would otherwise render it as <|channel>thought
+            // blocks. The current turn's reasoning is generated fresh, never an input, so this only drops history.
+            for (auto & m : inputs.messages) {
+                m.reasoning_content.clear();
+            }
             inputs.add_generation_prompt = true;
             inputs.reasoning_format      = st.reasoning_format;
             if (body.contains("tools") && !body.at("tools").is_null()) {
