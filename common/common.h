@@ -876,7 +876,9 @@ struct common_sampler;
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
-    common_init_result(common_params & params, bool model_only = false);
+    // shared_model != nullptr: borrow the given model instead of loading from file;
+    // the borrowed model is NOT owned and will not be freed by this result.
+    common_init_result(common_params & params, bool model_only = false, llama_model * shared_model = nullptr);
     ~common_init_result();
 
     llama_model * model();
@@ -894,7 +896,9 @@ private:
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+// shared_model != nullptr: borrow the given model (loaded once by the caller) instead of
+// loading it from file; the borrowed model is not owned and will not be freed.
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false, llama_model * shared_model = nullptr);
 
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);

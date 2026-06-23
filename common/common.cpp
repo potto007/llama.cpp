@@ -1168,12 +1168,21 @@ static void common_init_sampler_from_model(
 
 struct common_init_result::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        // when the model is borrowed (shared across multiple results / contexts), it is
+        // owned by the caller; release it so the unique_ptr deleter does not free it.
+        if (!owns_model) {
+            model.release();
+        }
+    }
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
     llama_model_ptr   model;
     llama_context_ptr context;
+
+    // false when the model was borrowed via the shared_model path (caller owns it)
+    bool owns_model = true;
 
     std::vector<llama_adapter_lora_ptr> lora;
 
@@ -1181,12 +1190,13 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-common_init_result::common_init_result(common_params & params, bool model_only) :
+common_init_result::common_init_result(common_params & params, bool model_only, llama_model * shared_model) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    // fitting params probes the model file on disk; only meaningful when we load it ourselves
+    if (params.fit_params && shared_model == nullptr) {
         LOG_INF("%s: fitting params to device memory ...\n", __func__);
         LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
@@ -1197,7 +1207,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    llama_model * model = nullptr;
+    if (shared_model != nullptr) {
+        // borrow a model already loaded by the caller; do not free it on teardown
+        model = shared_model;
+        pimpl->owns_model = false;
+    } else {
+        model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    }
     if (model == NULL) {
         return;
     }
@@ -1311,8 +1328,8 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only, llama_model * shared_model) {
+    common_init_result_ptr res(new common_init_result(params, model_only, shared_model));
 
     llama_model * model = res->model();
     if (model == NULL) {

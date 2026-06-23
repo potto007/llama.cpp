@@ -61,7 +61,10 @@ struct server_context {
 
     // load the model and initialize llama_context
     // returns true on success
-    bool load_model(common_params & params);
+    // shared_model != nullptr: borrow a model already loaded by the caller (shared across
+    // multiple server_context instances); the borrowed model is not owned and is not freed
+    // on teardown. The llama_context (and its KV cache) is always created and freed locally.
+    bool load_model(common_params & params, llama_model * shared_model = nullptr);
 
     // this function will block main thread until termination
     void start_loop();

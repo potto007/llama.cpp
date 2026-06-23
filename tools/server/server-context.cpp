@@ -684,6 +684,10 @@ private:
 
     common_params params_base;
 
+    // when non-null, the model is borrowed from the caller (shared across server_context
+    // instances) and must not be freed here; also reused when resuming from sleeping state.
+    llama_model * shared_model = nullptr;
+
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
@@ -762,8 +766,14 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
-    bool load_model(common_params & params) {
+    // shared_model != nullptr: borrow a caller-owned model instead of loading from file
+    bool load_model(common_params & params, llama_model * shared_model_in = nullptr) {
         bool is_resume = sleeping;
+
+        // remember the borrowed model so a resume-from-sleeping reuses it (never reloads from file)
+        if (shared_model_in != nullptr) {
+            shared_model = shared_model_in;
+        }
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
@@ -890,7 +900,7 @@ private:
             }
         }
 
-        llama_init = common_init_from_params(params_base);
+        llama_init = common_init_from_params(params_base, /*model_only*/ false, shared_model);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -3555,8 +3565,8 @@ private:
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
-bool server_context::load_model(common_params & params) {
-    return impl->load_model(params);
+bool server_context::load_model(common_params & params, llama_model * shared_model) {
+    return impl->load_model(params, shared_model);
 }
 
 void server_context::start_loop() {
